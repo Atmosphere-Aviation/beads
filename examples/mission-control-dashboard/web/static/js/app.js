@@ -208,6 +208,10 @@ async function loadAllIssues() {
     }
 }
 
+// Type presets for filtering
+const WORK_TYPES = ['task', 'bug', 'feature', 'epic', 'chore'];
+const SYSTEM_TYPES = ['message', 'event', 'convoy', 'molecule', 'gate', 'agent', 'role'];
+
 function filterAndRenderAll() {
     const statusFilter = document.getElementById('filter-status').value;
     const priorityFilter = document.getElementById('filter-priority').value;
@@ -217,7 +221,21 @@ function filterAndRenderAll() {
     let filtered = allIssues.filter(issue => {
         if (statusFilter && issue.status !== statusFilter) return false;
         if (priorityFilter !== '' && issue.priority !== parseInt(priorityFilter)) return false;
-        if (typeFilter && issue.issue_type !== typeFilter) return false;
+
+        // Type filtering with presets
+        if (typeFilter === 'work') {
+            // Work types only, excluding wisp prefix
+            if (!WORK_TYPES.includes(issue.issue_type)) return false;
+            if (issue.id && issue.id.includes('-wisp-')) return false;
+        } else if (typeFilter === 'system') {
+            // System types only
+            if (!SYSTEM_TYPES.includes(issue.issue_type)) return false;
+        } else if (typeFilter) {
+            // Specific type filter
+            if (issue.issue_type !== typeFilter) return false;
+        }
+        // Empty typeFilter = all types
+
         if (textFilter) {
             const title = (issue.title || '').toLowerCase();
             const desc = (issue.description || '').toLowerCase();

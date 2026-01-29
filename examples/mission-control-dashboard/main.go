@@ -41,9 +41,10 @@ var (
 	wsClientsMu sync.Mutex
 	wsBroadcast = make(chan []byte, 256)
 
-	daemonClient *rpc.Client
-	webFS        fs.FS
-	gtURL        string
+	daemonClient   *rpc.Client
+	daemonClientMu sync.Mutex // Protects concurrent RPC calls
+	webFS          fs.FS
+	gtURL          string
 )
 
 func main() {
@@ -159,6 +160,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAPIIssues(w http.ResponseWriter, r *http.Request) {
+	daemonClientMu.Lock()
+	defer daemonClientMu.Unlock()
+
 	if daemonClient == nil {
 		http.Error(w, "Daemon not connected", http.StatusInternalServerError)
 		return
@@ -187,6 +191,9 @@ func handleAPIIssueDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	daemonClientMu.Lock()
+	defer daemonClientMu.Unlock()
+
 	if daemonClient == nil {
 		http.Error(w, "Daemon not connected", http.StatusInternalServerError)
 		return
@@ -209,6 +216,9 @@ func handleAPIIssueDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAPIReady(w http.ResponseWriter, r *http.Request) {
+	daemonClientMu.Lock()
+	defer daemonClientMu.Unlock()
+
 	if daemonClient == nil {
 		http.Error(w, "Daemon not connected", http.StatusInternalServerError)
 		return
@@ -231,6 +241,9 @@ func handleAPIReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAPIStats(w http.ResponseWriter, r *http.Request) {
+	daemonClientMu.Lock()
+	defer daemonClientMu.Unlock()
+
 	if daemonClient == nil {
 		http.Error(w, "Daemon not connected", http.StatusInternalServerError)
 		return
@@ -253,6 +266,9 @@ func handleAPIStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAPIEpics(w http.ResponseWriter, r *http.Request) {
+	daemonClientMu.Lock()
+	defer daemonClientMu.Unlock()
+
 	if daemonClient == nil {
 		http.Error(w, "Daemon not connected", http.StatusInternalServerError)
 		return
@@ -333,11 +349,14 @@ func pollMutations() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		daemonClientMu.Lock()
 		if daemonClient == nil {
+			daemonClientMu.Unlock()
 			continue
 		}
 
 		resp, err := daemonClient.GetMutations(&rpc.GetMutationsArgs{Since: lastPollTime})
+		daemonClientMu.Unlock()
 		if err != nil {
 			continue
 		}

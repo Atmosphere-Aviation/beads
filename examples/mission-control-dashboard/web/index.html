@@ -108,21 +108,24 @@
         <!-- ALL ISSUES VIEW -->
         <div id="view-all" class="view-content">
             <h2 class="section-header">All Issues</h2>
-            <div class="filter-bar">
-                <select id="filter-status" class="filter-select">
+            <div class="filter-bar" role="search" aria-label="Filter issues">
+                <label for="filter-status" class="sr-only">Filter by status</label>
+                <select id="filter-status" class="filter-select" aria-label="Filter by status">
                     <option value="">All Status</option>
                     <option value="open">Open</option>
                     <option value="in_progress">In Progress</option>
                     <option value="closed">Closed</option>
                 </select>
-                <select id="filter-priority" class="filter-select">
+                <label for="filter-priority" class="sr-only">Filter by priority</label>
+                <select id="filter-priority" class="filter-select" aria-label="Filter by priority">
                     <option value="">All Priority</option>
                     <option value="0">P0 - Critical</option>
                     <option value="1">P1 - High</option>
                     <option value="2">P2 - Normal</option>
                     <option value="3">P3 - Low</option>
                 </select>
-                <select id="filter-type" class="filter-select">
+                <label for="filter-type" class="sr-only">Filter by type</label>
+                <select id="filter-type" class="filter-select" aria-label="Filter by type">
                     <option value="work" selected>Work Only</option>
                     <option value="system">System Only</option>
                     <option value="">All Types</option>
@@ -135,7 +138,8 @@
                     <option value="event">Event</option>
                     <option value="convoy">Convoy</option>
                 </select>
-                <input type="text" id="filter-text" class="filter-input" placeholder="Search...">
+                <label for="filter-text" class="sr-only">Search issues</label>
+                <input type="text" id="filter-text" class="filter-input" placeholder="Search..." aria-label="Search issues">
             </div>
             <table class="convoy-table" id="all-table">
                 <thead>
@@ -160,14 +164,14 @@
         </div>
 
         <!-- Issue Detail Modal -->
-        <div id="issue-modal" class="modal">
-            <div class="modal-content">
+        <div id="issue-modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-hidden="true">
+            <div class="modal-content" role="document">
                 <div class="modal-header">
                     <h2 id="modal-title">Issue Details</h2>
-                    <button class="modal-close">&times;</button>
+                    <button class="modal-close" aria-label="Close modal">&times;</button>
                 </div>
                 <div id="modal-body">
-                    <div class="spinner"></div>
+                    <div class="spinner" role="status" aria-label="Loading"></div>
                 </div>
             </div>
         </div>

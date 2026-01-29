@@ -106,6 +106,7 @@ func main() {
 	http.HandleFunc("/api/stats", handleAPIStats)
 	http.HandleFunc("/api/epics", handleAPIEpics)
 	http.HandleFunc("/api/config", handleAPIConfig)
+	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/ws", handleWebSocket)
 	http.Handle("/static/", http.StripPrefix("/", http.FileServer(http.FS(webFS))))
 
@@ -306,6 +307,25 @@ func handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(config)
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	daemonClientMu.Lock()
+	daemonConnected := daemonClient != nil
+	daemonClientMu.Unlock()
+
+	status := "healthy"
+	if !daemonConnected {
+		status = "degraded"
+	}
+
+	health := map[string]interface{}{
+		"status":           status,
+		"daemon_connected": daemonConnected,
+		"websocket_clients": len(wsClients),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(health)
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {

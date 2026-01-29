@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beads Dashboard - Mission Control</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <div class="dashboard">
+        <!-- Header: Brand+Live | spacer | Nav + Stats -->
+        <div class="header-row">
+            <div class="brand-section">
+                <img src="https://atmosphere-aviation.com/wp-content/uploads/2023/04/atmosphere-aviation-private-jet-logo.png.webp" alt="Atmosphere Aviation" class="logo">
+                <h1>Beads Dashboard</h1>
+                <div class="live-indicator" id="connection-status">
+                    <span class="live-dot" id="connection-dot"></span>
+                    <span id="connection-text">Connecting...</span>
+                </div>
+            </div>
+
+            <div class="header-spacer"></div>
+
+            <!-- Navigation -->
+            <div class="nav-links">
+                <a href="#" id="nav-gt" class="nav-link" title="Go to GT Mission Control">
+                    <span class="nav-icon">🚚</span> Mission Control
+                </a>
+            </div>
+
+            <div class="stats-row">
+                <div class="stat-mini" id="stat-ready">
+                    <div class="value">-</div>
+                    <div class="label">Ready</div>
+                </div>
+                <div class="stat-mini" id="stat-in-progress">
+                    <div class="value">-</div>
+                    <div class="label">Active</div>
+                </div>
+                <div class="stat-mini" id="stat-open">
+                    <div class="value">-</div>
+                    <div class="label">Open</div>
+                </div>
+                <div class="stat-mini" id="stat-total">
+                    <div class="value">-</div>
+                    <div class="label">Total</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- View Tabs -->
+        <div class="view-tabs">
+            <button class="tab-btn active" data-view="ready">Ready Queue</button>
+            <button class="tab-btn" data-view="epics">Epics</button>
+            <button class="tab-btn" data-view="all">All Issues</button>
+        </div>
+
+        <!-- READY QUEUE VIEW (Primary) -->
+        <div id="view-ready" class="view-content active">
+            <h2 class="section-header">Ready Queue</h2>
+            <p class="section-subtitle">Issues with no blockers - ready for convoy assignment</p>
+            <table class="convoy-table" id="ready-table">
+                <thead>
+                    <tr>
+                        <th class="col-status">Priority</th>
+                        <th class="col-shrink">ID</th>
+                        <th class="text-left">Title</th>
+                        <th class="col-shrink">Type</th>
+                        <th class="col-actions">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="ready-tbody">
+                    <tr><td colspan="5" class="loading-cell"><div class="spinner"></div></td></tr>
+                </tbody>
+            </table>
+            <div class="empty-state" id="ready-empty" style="display: none;">
+                <div class="empty-icon">✓</div>
+                <h3>All caught up!</h3>
+                <p>No ready issues. Create new work or resolve blockers.</p>
+            </div>
+        </div>
+
+        <!-- EPICS VIEW -->
+        <div id="view-epics" class="view-content">
+            <h2 class="section-header">Epics</h2>
+            <p class="section-subtitle">Parent issues organizing related work</p>
+            <table class="convoy-table" id="epics-table">
+                <thead>
+                    <tr>
+                        <th class="col-status">Status</th>
+                        <th class="col-shrink">ID</th>
+                        <th class="text-left">Title</th>
+                        <th class="col-shrink">Children</th>
+                        <th class="col-actions">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="epics-tbody">
+                    <tr><td colspan="5" class="loading-cell"><div class="spinner"></div></td></tr>
+                </tbody>
+            </table>
+            <div class="empty-state" id="epics-empty" style="display: none;">
+                <div class="empty-icon">📁</div>
+                <h3>No epics</h3>
+                <p>Create an epic to organize related work.</p>
+            </div>
+        </div>
+
+        <!-- ALL ISSUES VIEW -->
+        <div id="view-all" class="view-content">
+            <h2 class="section-header">All Issues</h2>
+            <div class="filter-bar">
+                <select id="filter-status" class="filter-select">
+                    <option value="">All Status</option>
+                    <option value="open">Open</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="closed">Closed</option>
+                </select>
+                <select id="filter-priority" class="filter-select">
+                    <option value="">All Priority</option>
+                    <option value="0">P0 - Critical</option>
+                    <option value="1">P1 - High</option>
+                    <option value="2">P2 - Normal</option>
+                    <option value="3">P3 - Low</option>
+                </select>
+                <select id="filter-type" class="filter-select">
+                    <option value="">All Types</option>
+                    <option value="task">Task</option>
+                    <option value="bug">Bug</option>
+                    <option value="feature">Feature</option>
+                    <option value="epic">Epic</option>
+                    <option value="chore">Chore</option>
+                </select>
+                <input type="text" id="filter-text" class="filter-input" placeholder="Search...">
+            </div>
+            <table class="convoy-table" id="all-table">
+                <thead>
+                    <tr>
+                        <th class="col-status">Status</th>
+                        <th class="col-shrink">Priority</th>
+                        <th class="col-shrink">ID</th>
+                        <th class="text-left">Title</th>
+                        <th class="col-shrink">Type</th>
+                        <th class="col-actions">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="all-tbody">
+                    <tr><td colspan="6" class="loading-cell"><div class="spinner"></div></td></tr>
+                </tbody>
+            </table>
+            <div class="empty-state" id="all-empty" style="display: none;">
+                <div class="empty-icon">📋</div>
+                <h3>No issues found</h3>
+                <p>Adjust filters or create new issues.</p>
+            </div>
+        </div>
+
+        <!-- Issue Detail Modal -->
+        <div id="issue-modal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2 id="modal-title">Issue Details</h2>
+                    <button class="modal-close">&times;</button>
+                </div>
+                <div id="modal-body">
+                    <div class="spinner"></div>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <span>Beads Dashboard v1.0</span>
+            <span id="db-path"></span>
+            <span class="updated" id="last-updated">Connecting...</span>
+        </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

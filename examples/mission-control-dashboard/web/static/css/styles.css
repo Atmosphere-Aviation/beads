@@ -569,6 +569,126 @@ footer .updated {
     font-size: 0.75rem;
 }
 
+/* Label Badges */
+.label-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 0.7rem;
+    font-weight: 500;
+    background: var(--accent-dim);
+    color: var(--accent);
+    margin-right: 4px;
+}
+
+/* Issue Links */
+.issue-link {
+    color: var(--accent);
+    text-decoration: none;
+    font-family: 'SF Mono', monospace;
+    font-size: 0.8rem;
+}
+
+.issue-link:hover {
+    text-decoration: underline;
+}
+
+/* Status Dots (small inline indicators) */
+.status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+}
+
+.status-dot.status-open { background: var(--accent); }
+.status-dot.status-in_progress { background: var(--yellow); }
+.status-dot.status-closed { background: var(--green); }
+
+/* Children/Dependencies Lists */
+.children-list, .dep-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.children-list li, .dep-list li {
+    padding: 8px 12px;
+    background: var(--bg-dark);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 6px;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+}
+
+.children-list li:hover, .dep-list li:hover {
+    border-color: var(--accent);
+    background: var(--accent-dim);
+}
+
+/* Progress Badge (for epics) */
+.progress-badge {
+    font-family: 'SF Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.progress-badge.progress-complete {
+    color: var(--green);
+    font-weight: 600;
+}
+
+/* Comments Section */
+.comments-section {
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+}
+
+.comment {
+    background: var(--bg-dark);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    margin-bottom: 12px;
+}
+
+.comment-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+.comment-author {
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+.comment-date {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.comment-text {
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
 /* Responsive */
 @media (max-width: 768px) {
     .header-row {

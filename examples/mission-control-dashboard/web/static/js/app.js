@@ -184,15 +184,24 @@ function renderEpics() {
     table.style.display = '';
     empty.style.display = 'none';
 
-    tbody.innerHTML = epics.map(epic => `
-        <tr onclick="showIssueDetail('${epic.id}')">
-            <td><span class="status-badge status-${epic.status}">${formatStatus(epic.status)}</span></td>
-            <td><span class="issue-id">${epic.id}</span></td>
-            <td class="text-left">${escapeHtml(epic.title)}</td>
-            <td>-</td>
-            <td><button class="action-btn" onclick="event.stopPropagation(); showIssueDetail('${epic.id}')">View</button></td>
-        </tr>
-    `).join('');
+    // epics is now EpicStatus[] with epic, total_children, closed_children
+    tbody.innerHTML = epics.map(epicStatus => {
+        const epic = epicStatus.epic || epicStatus; // Handle both formats
+        const total = epicStatus.total_children || 0;
+        const closed = epicStatus.closed_children || 0;
+        const progress = total > 0 ? `${closed}/${total}` : '-';
+        const progressClass = total > 0 && closed === total ? 'progress-complete' : '';
+
+        return `
+            <tr onclick="showIssueDetail('${epic.id}')">
+                <td><span class="status-badge status-${epic.status}">${formatStatus(epic.status)}</span></td>
+                <td><span class="issue-id">${epic.id}</span></td>
+                <td class="text-left">${escapeHtml(epic.title)}</td>
+                <td><span class="progress-badge ${progressClass}">${progress}</span></td>
+                <td><button class="action-btn" onclick="event.stopPropagation(); showIssueDetail('${epic.id}')">View</button></td>
+            </tr>
+        `;
+    }).join('');
 }
 
 // Load All Issues
@@ -302,6 +311,71 @@ async function showIssueDetail(issueId) {
         const issue = await response.json();
         title.textContent = `${issue.id}: ${issue.title}`;
 
+        // Build labels HTML
+        const labelsHtml = issue.labels && issue.labels.length > 0
+            ? `<div class="detail-row">
+                <span class="detail-label">Labels</span>
+                <span class="detail-value">${issue.labels.map(l => `<span class="label-badge">${escapeHtml(l)}</span>`).join(' ')}</span>
+               </div>`
+            : '';
+
+        // Build parent HTML (from dependencies with parent-child type)
+        const parentDep = issue.dependencies && issue.dependencies.find(d => d.dependency_type === 'parent-child');
+        const parentHtml = parentDep
+            ? `<div class="detail-row">
+                <span class="detail-label">Parent</span>
+                <span class="detail-value"><a href="#" onclick="showIssueDetail('${parentDep.id}'); return false;" class="issue-link">${parentDep.id}</a> ${escapeHtml(parentDep.title || '')}</span>
+               </div>`
+            : '';
+
+        // Build children HTML (from dependents with parent-child type)
+        const children = issue.dependents && issue.dependents.filter(d => d.dependency_type === 'parent-child');
+        const childrenHtml = children && children.length > 0
+            ? `<div class="detail-section">
+                <h4>Children (${children.length})</h4>
+                <ul class="children-list">
+                    ${children.map(c => `<li><span class="status-dot status-${c.status}"></span><a href="#" onclick="showIssueDetail('${c.id}'); return false;" class="issue-link">${c.id}</a> ${escapeHtml(c.title || '')}</li>`).join('')}
+                </ul>
+               </div>`
+            : '';
+
+        // Build blocking dependencies HTML (issues this blocks or is blocked by)
+        const blockers = issue.dependencies && issue.dependencies.filter(d => d.dependency_type === 'blocks');
+        const blockersHtml = blockers && blockers.length > 0
+            ? `<div class="detail-section">
+                <h4>Blocked By (${blockers.length})</h4>
+                <ul class="dep-list">
+                    ${blockers.map(d => `<li><span class="status-dot status-${d.status}"></span><a href="#" onclick="showIssueDetail('${d.id}'); return false;" class="issue-link">${d.id}</a> ${escapeHtml(d.title || '')}</li>`).join('')}
+                </ul>
+               </div>`
+            : '';
+
+        const blocking = issue.dependents && issue.dependents.filter(d => d.dependency_type === 'blocks');
+        const blockingHtml = blocking && blocking.length > 0
+            ? `<div class="detail-section">
+                <h4>Blocking (${blocking.length})</h4>
+                <ul class="dep-list">
+                    ${blocking.map(d => `<li><span class="status-dot status-${d.status}"></span><a href="#" onclick="showIssueDetail('${d.id}'); return false;" class="issue-link">${d.id}</a> ${escapeHtml(d.title || '')}</li>`).join('')}
+                </ul>
+               </div>`
+            : '';
+
+        // Build comments HTML
+        const commentsHtml = issue.comments && issue.comments.length > 0
+            ? `<div class="detail-section comments-section">
+                <h4>Comments (${issue.comments.length})</h4>
+                ${issue.comments.map(c => `
+                    <div class="comment">
+                        <div class="comment-header">
+                            <span class="comment-author">${escapeHtml(c.author || 'Unknown')}</span>
+                            <span class="comment-date">${formatDate(c.created_at)}</span>
+                        </div>
+                        <pre class="comment-text">${escapeHtml(c.text)}</pre>
+                    </div>
+                `).join('')}
+               </div>`
+            : '';
+
         body.innerHTML = `
             <div class="detail-row">
                 <span class="detail-label">Status</span>
@@ -315,6 +389,8 @@ async function showIssueDetail(issueId) {
                 <span class="detail-label">Type</span>
                 <span class="detail-value"><span class="type-badge type-${issue.issue_type || 'task'}">${issue.issue_type || 'task'}</span></span>
             </div>
+            ${labelsHtml}
+            ${parentHtml}
             ${issue.assignee ? `
             <div class="detail-row">
                 <span class="detail-label">Assignee</span>
@@ -353,6 +429,10 @@ async function showIssueDetail(issueId) {
                 <pre>${escapeHtml(issue.notes)}</pre>
             </div>
             ` : ''}
+            ${childrenHtml}
+            ${blockersHtml}
+            ${blockingHtml}
+            ${commentsHtml}
         `;
     } catch (error) {
         body.innerHTML = '<p>Error loading issue details</p>';

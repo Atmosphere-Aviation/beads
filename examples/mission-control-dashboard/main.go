@@ -205,14 +205,15 @@ func handleAPIIssueDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var issue *types.Issue
-	if err := json.Unmarshal(resp.Data, &issue); err != nil {
+	// RPC Show returns IssueDetails with labels, dependencies, dependents, comments
+	var details *types.IssueDetails
+	if err := json.Unmarshal(resp.Data, &details); err != nil {
 		http.Error(w, fmt.Sprintf("JSON error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(issue)
+	json.NewEncoder(w).Encode(details)
 }
 
 func handleAPIReady(w http.ResponseWriter, r *http.Request) {
@@ -274,27 +275,21 @@ func handleAPIEpics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := daemonClient.List(&rpc.ListArgs{})
+	// Use EpicStatus RPC to get epics with child counts
+	resp, err := daemonClient.EpicStatus(&rpc.EpicStatusArgs{})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("RPC error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	var allIssues []*types.Issue
-	if err := json.Unmarshal(resp.Data, &allIssues); err != nil {
+	var epicStatuses []*types.EpicStatus
+	if err := json.Unmarshal(resp.Data, &epicStatuses); err != nil {
 		http.Error(w, fmt.Sprintf("JSON error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	var epics []*types.Issue
-	for _, issue := range allIssues {
-		if issue.IssueType == "epic" {
-			epics = append(epics, issue)
-		}
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(epics)
+	json.NewEncoder(w).Encode(epicStatuses)
 }
 
 func handleAPIConfig(w http.ResponseWriter, r *http.Request) {

@@ -449,8 +449,27 @@ function selectForConvoy(issueId) {
     alert(`Selected ${issueId} for convoy.\n\nFuture: This will integrate with GT convoy creation.`);
 }
 
+// Manual refresh
+function refreshAllData() {
+    const btn = document.getElementById('refresh-btn');
+    btn.classList.add('refreshing');
+
+    Promise.all([
+        loadStats(),
+        loadReadyQueue(),
+        loadEpics(),
+        loadAllIssues()
+    ]).finally(() => {
+        btn.classList.remove('refreshing');
+        updateLastUpdated();
+    });
+}
+
 // Setup event listeners
 function setupEventListeners() {
+    // Refresh button
+    document.getElementById('refresh-btn').addEventListener('click', refreshAllData);
+
     // Tab switching
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {

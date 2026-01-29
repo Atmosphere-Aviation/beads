@@ -288,8 +288,16 @@ func handleAPIEpics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Filter out tombstone epics - they are deleted and shouldn't appear in dashboard
+	var filtered []*types.EpicStatus
+	for _, es := range epicStatuses {
+		if es.Epic != nil && es.Epic.Status != "tombstone" {
+			filtered = append(filtered, es)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(epicStatuses)
+	json.NewEncoder(w).Encode(filtered)
 }
 
 func handleAPIConfig(w http.ResponseWriter, r *http.Request) {

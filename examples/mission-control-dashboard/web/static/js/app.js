@@ -143,11 +143,11 @@ function renderReadyQueue() {
     empty.style.display = 'none';
 
     // Sort by priority (P0 first)
-    const sorted = [...readyIssues].sort((a, b) => (a.priority || 2) - (b.priority || 2));
+    const sorted = [...readyIssues].sort((a, b) => (a.priority ?? 2) - (b.priority ?? 2));
 
     tbody.innerHTML = sorted.map(issue => `
         <tr onclick="showIssueDetail('${issue.id}')">
-            <td><span class="priority-badge priority-${issue.priority || 2}">P${issue.priority || 2}</span></td>
+            <td><span class="priority-badge priority-${issue.priority ?? 2}">P${issue.priority ?? 2}</span></td>
             <td><span class="issue-id">${issue.id}</span></td>
             <td class="text-left">${escapeHtml(issue.title)}</td>
             <td><span class="type-badge type-${issue.issue_type || 'task'}">${issue.issue_type || 'task'}</span></td>
@@ -279,13 +279,13 @@ function renderAllIssues(issues) {
         const statusOrder = { 'in_progress': 0, 'open': 1, 'closed': 2 };
         const statusDiff = (statusOrder[a.status] || 1) - (statusOrder[b.status] || 1);
         if (statusDiff !== 0) return statusDiff;
-        return (a.priority || 2) - (b.priority || 2);
+        return (a.priority ?? 2) - (b.priority ?? 2);
     });
 
     tbody.innerHTML = sorted.map(issue => `
         <tr onclick="showIssueDetail('${issue.id}')">
             <td><span class="status-badge status-${issue.status}">${formatStatus(issue.status)}</span></td>
-            <td><span class="priority-badge priority-${issue.priority || 2}">P${issue.priority || 2}</span></td>
+            <td><span class="priority-badge priority-${issue.priority ?? 2}">P${issue.priority ?? 2}</span></td>
             <td><span class="issue-id">${issue.id}</span></td>
             <td class="text-left">${escapeHtml(issue.title)}</td>
             <td><span class="type-badge type-${issue.issue_type || 'task'}">${issue.issue_type || 'task'}</span></td>
@@ -383,7 +383,7 @@ async function showIssueDetail(issueId) {
             </div>
             <div class="detail-row">
                 <span class="detail-label">Priority</span>
-                <span class="detail-value"><span class="priority-badge priority-${issue.priority || 2}">P${issue.priority || 2}</span></span>
+                <span class="detail-value"><span class="priority-badge priority-${issue.priority ?? 2}">P${issue.priority ?? 2}</span></span>
             </div>
             <div class="detail-row">
                 <span class="detail-label">Type</span>

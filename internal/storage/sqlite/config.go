@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 // SetConfig sets a configuration value
@@ -22,6 +25,7 @@ func (s *SQLiteStorage) SetConfig(ctx context.Context, key, value string) error 
 
 // GetConfig gets a configuration value
 func (s *SQLiteStorage) GetConfig(ctx context.Context, key string) (string, error) {
+	s.checkFreshness()
 	// Hold read lock during database operations to prevent reconnect() from
 	// closing the connection mid-query (GH#607 race condition fix)
 	s.reconnectMu.RLock()
@@ -37,6 +41,7 @@ func (s *SQLiteStorage) GetConfig(ctx context.Context, key string) (string, erro
 
 // GetAllConfig gets all configuration key-value pairs
 func (s *SQLiteStorage) GetAllConfig(ctx context.Context) (map[string]string, error) {
+	s.checkFreshness()
 	// Hold read lock during database operations to prevent reconnect() from
 	// closing the connection mid-query (GH#607 race condition fix)
 	s.reconnectMu.RLock()
@@ -70,14 +75,17 @@ func (s *SQLiteStorage) DeleteConfig(ctx context.Context, key string) error {
 	return wrapDBError("delete config", err)
 }
 
-// OrphanHandling defines how to handle orphan issues during import
-type OrphanHandling string
+// OrphanHandling is an alias for storage.OrphanHandling for backward compatibility.
+// Deprecated: Use storage.OrphanHandling directly.
+type OrphanHandling = storage.OrphanHandling
 
+// Orphan handling constants - aliases for storage package constants.
+// Deprecated: Use storage.OrphanStrict, etc. directly.
 const (
-	OrphanStrict    OrphanHandling = "strict"     // Reject imports with orphans
-	OrphanResurrect OrphanHandling = "resurrect"  // Auto-resurrect parents from JSONL
-	OrphanSkip      OrphanHandling = "skip"       // Skip orphans silently
-	OrphanAllow     OrphanHandling = "allow"      // Allow orphans (default)
+	OrphanStrict    = storage.OrphanStrict    // Reject imports with orphans
+	OrphanResurrect = storage.OrphanResurrect // Auto-resurrect parents from JSONL
+	OrphanSkip      = storage.OrphanSkip      // Skip orphans silently
+	OrphanAllow     = storage.OrphanAllow     // Allow orphans (default)
 )
 
 // GetOrphanHandling gets the import.orphan_handling config value
@@ -112,6 +120,7 @@ func (s *SQLiteStorage) SetMetadata(ctx context.Context, key, value string) erro
 
 // GetMetadata gets a metadata value (for internal state like import hashes)
 func (s *SQLiteStorage) GetMetadata(ctx context.Context, key string) (string, error) {
+	s.checkFreshness()
 	// Hold read lock during database operations to prevent reconnect() from
 	// closing the connection mid-query (GH#607 race condition fix)
 	s.reconnectMu.RLock()
@@ -147,16 +156,27 @@ func (s *SQLiteStorage) GetCustomStatuses(ctx context.Context) ([]string, error)
 
 // GetCustomTypes retrieves the list of custom issue types from config.
 // Custom types are stored as comma-separated values in the "types.custom" config key.
+// If the database doesn't have custom types configured, falls back to config.yaml.
+// This fallback is essential during bd init when the database is being created
+// but auto-import needs to validate issues with custom types (GH#1225).
 // Returns an empty slice if no custom types are configured.
 func (s *SQLiteStorage) GetCustomTypes(ctx context.Context) ([]string, error) {
 	value, err := s.GetConfig(ctx, CustomTypeConfigKey)
 	if err != nil {
 		return nil, err
 	}
-	if value == "" {
-		return nil, nil
+	if value != "" {
+		return parseCommaSeparatedList(value), nil
 	}
-	return parseCommaSeparatedList(value), nil
+
+	// Fallback to config.yaml when database doesn't have types.custom set.
+	// This allows auto-import during bd init to work with custom types
+	// defined in config.yaml before they're persisted to the database.
+	if yamlTypes := config.GetCustomTypesFromYAML(); len(yamlTypes) > 0 {
+		return yamlTypes, nil
+	}
+
+	return nil, nil
 }
 
 // parseCommaSeparatedList splits a comma-separated string into a slice of trimmed entries.

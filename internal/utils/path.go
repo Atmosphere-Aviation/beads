@@ -42,12 +42,13 @@ func FindJSONLInDir(dbDir string) string {
 		}
 	}
 
-	// Last resort: use first match (but skip deletions.jsonl, interactions.jsonl, and merge artifacts)
+	// Last resort: use first match (but skip deletions.jsonl, interactions.jsonl, routes.jsonl, and merge artifacts)
 	for _, match := range matches {
 		base := filepath.Base(match)
-		// Skip deletions manifest, interactions (audit trail), and merge artifacts
+		// Skip deletions manifest, interactions (audit trail), routes config, and merge artifacts
 		if base == "deletions.jsonl" ||
 			base == "interactions.jsonl" ||
+			base == "routes.jsonl" ||
 			base == "beads.base.jsonl" ||
 			base == "beads.left.jsonl" ||
 			base == "beads.right.jsonl" {
@@ -186,4 +187,19 @@ func NormalizePathForComparison(path string) string {
 // paths in the daemon registry and discovery code.
 func PathsEqual(path1, path2 string) bool {
 	return NormalizePathForComparison(path1) == NormalizePathForComparison(path2)
+}
+
+// CanonicalizeIfRelative ensures a path is absolute for filepath.Rel() compatibility.
+// If the path is non-empty and relative, it is canonicalized using CanonicalizePath.
+// Absolute paths and empty strings are returned unchanged.
+//
+// This guards against code paths that might set paths to relative values,
+// which would cause filepath.Rel() to fail or produce incorrect results.
+//
+// See GH#959 for root cause analysis of the original autoflush bug.
+func CanonicalizeIfRelative(path string) string {
+	if path != "" && !filepath.IsAbs(path) {
+		return CanonicalizePath(path)
+	}
+	return path
 }

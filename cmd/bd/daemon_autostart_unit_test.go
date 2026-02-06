@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -37,6 +39,10 @@ func tempSockDir(t *testing.T) string {
 func startTestRPCServer(t *testing.T) (socketPath string, cleanup func()) {
 	t.Helper()
 
+	if isSandboxed() {
+		t.Skip("sandboxed environment blocks unix socket operations")
+	}
+
 	tmpDir := tempSockDir(t)
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
@@ -52,6 +58,10 @@ func startTestRPCServer(t *testing.T) (socketPath string, cleanup func()) {
 
 	server, _, err := startRPCServer(ctx, socketPath, store, tmpDir, db, log)
 	if err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) || os.IsPermission(err) {
+			cancel()
+			t.Skipf("unix sockets not permitted in this environment: %v", err)
+		}
 		cancel()
 		t.Fatalf("startRPCServer: %v", err)
 	}
@@ -145,6 +155,34 @@ func TestDaemonAutostart_AcquireStartLock_CreatesMissingDir(t *testing.T) {
 	}
 }
 
+func TestDaemonAutostart_AcquireStartLock_FailsWhenRemoveFails(t *testing.T) {
+	// This test verifies that acquireStartLock returns false (instead of
+	// recursing infinitely) when os.Remove fails on a stale lock file.
+
+	oldRemove := removeFileFn
+	defer func() { removeFileFn = oldRemove }()
+
+	// Stub removeFileFn to always fail
+	removeFileFn = func(path string) error {
+		return os.ErrPermission
+	}
+
+	tmpDir := t.TempDir()
+	lockPath := filepath.Join(tmpDir, "bd.sock.startlock")
+	socketPath := filepath.Join(tmpDir, "bd.sock")
+
+	// Create a stale lock file with PID 0 (will be detected as dead)
+	if err := os.WriteFile(lockPath, []byte("0\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// acquireStartLock should return false since it can't remove the stale lock
+	// Previously, this would cause infinite recursion and stack overflow
+	if acquireStartLock(lockPath, socketPath) {
+		t.Fatalf("expected acquireStartLock to fail when remove fails")
+	}
+}
+
 func TestDaemonAutostart_SocketHealthAndReadiness(t *testing.T) {
 	socketPath, cleanup := startTestRPCServer(t)
 	defer cleanup()
@@ -207,14 +245,24 @@ func TestDaemonAutostart_HandleExistingSocket_StaleCleansUp(t *testing.T) {
 func TestDaemonAutostart_TryAutoStartDaemon_EarlyExits(t *testing.T) {
 	oldFailures := daemonStartFailures
 	oldLast := lastDaemonStartAttempt
+	oldDbPath := dbPath
 	defer func() {
 		daemonStartFailures = oldFailures
 		lastDaemonStartAttempt = oldLast
+		dbPath = oldDbPath
 	}()
+
+	// Set up a valid dbPath to pass the empty dbPath check (GH#1288)
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	dbPath = filepath.Join(beadsDir, "test.db")
 
 	daemonStartFailures = 1
 	lastDaemonStartAttempt = time.Now()
-	if tryAutoStartDaemon(filepath.Join(t.TempDir(), "bd.sock")) {
+	if tryAutoStartDaemon(filepath.Join(tmpDir, "bd.sock")) {
 		t.Fatalf("expected tryAutoStartDaemon to skip due to backoff")
 	}
 
@@ -222,6 +270,8 @@ func TestDaemonAutostart_TryAutoStartDaemon_EarlyExits(t *testing.T) {
 	lastDaemonStartAttempt = time.Time{}
 	socketPath, cleanup := startTestRPCServer(t)
 	defer cleanup()
+	// Update dbPath to match the test server's directory
+	dbPath = filepath.Join(filepath.Dir(socketPath), "test.db")
 	if !tryAutoStartDaemon(socketPath) {
 		t.Fatalf("expected tryAutoStartDaemon true when daemon already healthy")
 	}
@@ -232,9 +282,7 @@ func TestDaemonAutostart_MiscHelpers(t *testing.T) {
 		t.Fatalf("determineSocketPath should be identity")
 	}
 
-	if err := config.Initialize(); err != nil {
-		t.Fatalf("config.Initialize: %v", err)
-	}
+	initConfigForTest(t)
 	old := config.GetDuration("flush-debounce")
 	defer config.Set("flush-debounce", old)
 
@@ -282,11 +330,19 @@ func TestDaemonAutostart_StartDaemonProcess_Stubbed(t *testing.T) {
 	oldExec := execCommandFn
 	oldWait := waitForSocketReadinessFn
 	oldCfg := configureDaemonProcessFn
+	oldIsDolt := isDoltBackendFn
+	oldSingleProcess := singleProcessOnlyBackendFn
 	defer func() {
 		execCommandFn = oldExec
 		waitForSocketReadinessFn = oldWait
 		configureDaemonProcessFn = oldCfg
+		isDoltBackendFn = oldIsDolt
+		singleProcessOnlyBackendFn = oldSingleProcess
 	}()
+
+	// Stub out backend checks so they don't interfere with this test
+	isDoltBackendFn = func() bool { return false }
+	singleProcessOnlyBackendFn = func() bool { return false }
 
 	execCommandFn = func(string, ...string) *exec.Cmd {
 		return exec.Command(os.Args[0], "-test.run=^$")
@@ -329,6 +385,41 @@ func TestDaemonAutostart_StartDaemonProcess_NoGitRepo(t *testing.T) {
 	}
 	if !strings.Contains(output, "running without background sync") {
 		t.Errorf("expected output to contain 'running without background sync', got: %q", output)
+	}
+}
+
+func TestDaemonAutostart_StartDaemonProcess_NoGitRepo_Quiet(t *testing.T) {
+	// Test that startDaemonProcess suppresses the note when quietFlag is true
+	tmpDir := t.TempDir()
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	oldQuiet := quietFlag
+	defer func() {
+		_ = os.Chdir(oldDir)
+		quietFlag = oldQuiet
+	}()
+
+	// Change to a temp directory that is NOT a git repo
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+
+	// Enable quiet mode
+	quietFlag = true
+
+	// Capture stderr to verify the message is suppressed
+	output := captureStderr(t, func() {
+		result := startDaemonProcess(filepath.Join(tmpDir, "bd.sock"))
+		if result {
+			t.Errorf("expected startDaemonProcess to return false when not in git repo")
+		}
+	})
+
+	// Verify the message is NOT shown in quiet mode
+	if strings.Contains(output, "No git repository initialized") {
+		t.Errorf("expected no output in quiet mode, got: %q", output)
 	}
 }
 
@@ -523,5 +614,23 @@ func TestIsWispOperation(t *testing.T) {
 				t.Errorf("isWispOperation() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestTryAutoStartDaemon_EmptyDbPath verifies that tryAutoStartDaemon returns
+// false early when dbPath is empty, preventing stack overflow from
+// filepath.Dir("") returning "." (GH#1288)
+func TestTryAutoStartDaemon_EmptyDbPath(t *testing.T) {
+	// Save and restore global state
+	oldDbPath := dbPath
+	defer func() { dbPath = oldDbPath }()
+
+	// Set dbPath to empty string (simulates corrupted metadata.json)
+	dbPath = ""
+
+	// tryAutoStartDaemon should return false without crashing
+	result := tryAutoStartDaemon("/tmp/test.sock")
+	if result {
+		t.Errorf("tryAutoStartDaemon() = true, want false when dbPath is empty")
 	}
 }

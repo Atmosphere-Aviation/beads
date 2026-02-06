@@ -14,12 +14,37 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/utils"
 	"golang.org/x/term"
 )
+
+// DeletionMarker represents a compact deletion marker in JSONL format.
+// Format: {"id": "gt-123", "_deleted": true, "_deleted_at": "2026-01-17T10:30:00Z"}
+// These markers are used for incremental sync to propagate deletions efficiently
+// without sending full tombstone records.
+type DeletionMarker struct {
+	ID        string     `json:"id"`
+	Deleted   bool       `json:"_deleted"`
+	DeletedAt *time.Time `json:"_deleted_at,omitempty"`
+}
+
+// isDeletionMarker checks if a JSON line is a deletion marker.
+// Returns the parsed marker and true if it's a deletion marker, otherwise nil and false.
+func isDeletionMarker(line []byte) (*DeletionMarker, bool) {
+	var marker DeletionMarker
+	if err := json.Unmarshal(line, &marker); err != nil {
+		return nil, false
+	}
+	// A valid deletion marker must have an ID and _deleted=true
+	if marker.ID != "" && marker.Deleted {
+		return &marker, true
+	}
+	return nil, false
+}
 
 var importCmd = &cobra.Command{
 	Use:     "import",
@@ -73,10 +98,12 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 			daemonClient = nil
 
 			var err error
-			store, err = sqlite.New(rootCtx, dbPath)
+			beadsDir := filepath.Dir(dbPath)
+			store, err = factory.NewFromConfigWithOptions(rootCtx, beadsDir, factory.Options{
+				LockTimeout: lockTimeout,
+			})
 			if err != nil {
 				// Check for fresh clone scenario
-				beadsDir := filepath.Dir(dbPath)
 				if handleFreshCloneError(err, beadsDir) {
 					os.Exit(1)
 				}
@@ -136,6 +163,7 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 		scanner := bufio.NewScanner(in)
 
 		var allIssues []*types.Issue
+		var deletionMarkers []*DeletionMarker
 		lineNum := 0
 
 		for scanner.Scan() {
@@ -191,9 +219,10 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 					}()
 					in = f
 					scanner = bufio.NewScanner(in)
-					allIssues = nil // Reset issues list
-					lineNum = 0     // Reset line counter
-					continue        // Restart parsing from beginning
+					allIssues = nil        // Reset issues list
+					deletionMarkers = nil  // Reset deletion markers list
+					lineNum = 0            // Reset line counter
+					continue               // Restart parsing from beginning
 				} else {
 					// Can't retry stdin - should not happen since git conflicts only in files
 					fmt.Fprintf(os.Stderr, "Error: Cannot retry merge from stdin\n")
@@ -201,13 +230,56 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 				}
 			}
 
-			// Parse JSON
+			// Check for deletion markers first
+			// Format: {"id": "gt-123", "_deleted": true, "_deleted_at": "..."}
+			if marker, ok := isDeletionMarker(rawLine); ok {
+				deletionMarkers = append(deletionMarkers, marker)
+				if debug.Enabled() {
+					debug.Logf("Found deletion marker for issue %s\n", marker.ID)
+				}
+				continue // Skip normal issue parsing for deletion markers
+			}
+
+			// Parse JSON as regular issue
 			var issue types.Issue
 			if err := json.Unmarshal([]byte(line), &issue); err != nil {
 				fmt.Fprintf(os.Stderr, "Error parsing line %d: %v\n", lineNum, err)
 				os.Exit(1)
 			}
 			issue.SetDefaults() // Apply defaults for omitted fields (beads-399)
+
+			// Migrate old JSONL format: auto-correct deleted status to tombstone
+			// This handles JSONL files from versions that used "deleted" instead of "tombstone"
+			// (GH#1223: Stuck in sync diversion loop)
+			if issue.Status == types.Status("deleted") && issue.DeletedAt != nil {
+				issue.Status = types.StatusTombstone
+				if debug.Enabled() {
+					debug.Logf("Auto-corrected status 'deleted' to 'tombstone' for issue %s\n", issue.ID)
+				}
+			}
+
+			// Fix: Any non-tombstone issue with deleted_at set is malformed and should be tombstone
+			// This catches issues that may have been corrupted or migrated incorrectly
+			if issue.Status != types.StatusTombstone && issue.DeletedAt != nil {
+				issue.Status = types.StatusTombstone
+				if debug.Enabled() {
+					debug.Logf("Auto-corrected status %s to 'tombstone' (had deleted_at) for issue %s\n", issue.Status, issue.ID)
+				}
+			}
+
+			if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
+				now := time.Now()
+				issue.ClosedAt = &now
+			}
+
+			// Ensure tombstones have deleted_at set (fix for malformed data)
+			if issue.Status == types.StatusTombstone && issue.DeletedAt == nil {
+				now := time.Now()
+				issue.DeletedAt = &now
+				if debug.Enabled() {
+					debug.Logf("Auto-added deleted_at timestamp for tombstone issue %s\n", issue.ID)
+				}
+			}
 
 			allIssues = append(allIssues, &issue)
 		}
@@ -253,6 +325,12 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 		}
 
 		// Phase 2: Use shared import logic
+		// Extract deletion IDs from markers
+		var deletionIDs []string
+		for _, marker := range deletionMarkers {
+			deletionIDs = append(deletionIDs, marker.ID)
+		}
+
 		opts := ImportOptions{
 			DryRun:                     dryRun,
 			SkipUpdate:                 skipUpdate,
@@ -260,6 +338,7 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 			RenameOnImport:             renameOnImport,
 			ClearDuplicateExternalRefs: clearDuplicateExternalRefs,
 			OrphanHandling:             orphanHandling,
+			DeletionIDs:                deletionIDs,
 		}
 
 		// If --protect-left-snapshot is set, read the left snapshot and build timestamp map
@@ -338,6 +417,9 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 				fmt.Fprintf(os.Stderr, "No collisions detected.\n")
 			}
 			msg := fmt.Sprintf("Would create %d new issues, update %d existing issues", result.Created, result.Updated)
+			if result.Deleted > 0 {
+				msg += fmt.Sprintf(", delete %d issues", result.Deleted)
+			}
 			if result.Unchanged > 0 {
 				msg += fmt.Sprintf(", %d unchanged", result.Unchanged)
 			}
@@ -371,10 +453,15 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 			fmt.Fprintf(os.Stderr, "\nAll text and dependency references have been updated.\n")
 		}
 
+		// Record that this command performed a write (for Dolt auto-commit).
+		if result.Created > 0 || result.Updated > 0 || result.Deleted > 0 || len(result.IDMapping) > 0 {
+			commandDidWrite.Store(true)
+		}
+
 		// Flush immediately after import (no debounce) to ensure daemon sees changes
 		// Without this, daemon FileWatcher won't detect the import for up to 30s
 		// Only flush if there were actual changes to avoid unnecessary I/O
-		if result.Created > 0 || result.Updated > 0 || len(result.IDMapping) > 0 {
+		if result.Created > 0 || result.Updated > 0 || result.Deleted > 0 || len(result.IDMapping) > 0 {
 			flushToJSONLWithState(flushState{forceDirty: true})
 		}
 
@@ -422,6 +509,9 @@ NOTE: Import requires direct database access and does not work with daemon mode.
 
 		// Print summary
 		fmt.Fprintf(os.Stderr, "Import complete: %d created, %d updated", result.Created, result.Updated)
+		if result.Deleted > 0 {
+			fmt.Fprintf(os.Stderr, ", %d deleted", result.Deleted)
+		}
 		if result.Unchanged > 0 {
 			fmt.Fprintf(os.Stderr, ", %d unchanged", result.Unchanged)
 		}
@@ -553,7 +643,7 @@ func checkUncommittedChanges(filePath string, result *ImportResult) {
 		// Get line counts for context
 		workingTreeLines := countLines(filePath)
 		headLines := countLinesInGitHEAD(filePath, workDir)
-		
+
 		fmt.Fprintf(os.Stderr, "\n⚠️  Warning: %s has uncommitted changes\n", filePath)
 		fmt.Fprintf(os.Stderr, "   Working tree: %d lines\n", workingTreeLines)
 		if headLines > 0 {
@@ -635,20 +725,27 @@ func countLinesInGitHEAD(filePath string, workDir string) int {
 	return lines
 }
 
-// attemptAutoMerge attempts to resolve git conflicts using bd merge 3-way merge
+// attemptAutoMerge attempts to resolve git conflicts using bd merge 3-way merge.
+// GH#1110: Now uses RepoContext to ensure we operate on the beads repo.
 func attemptAutoMerge(conflictedPath string) error {
 	// Validate inputs
 	if conflictedPath == "" {
 		return fmt.Errorf("no file path provided for merge")
 	}
 
-	// Get git repository root
-	gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel") // #nosec G204 -- fixed git invocation for repo root discovery
-	gitRootOutput, err := gitRootCmd.Output()
-	if err != nil {
-		return fmt.Errorf("not in a git repository: %w", err)
+	// Get git repository root from RepoContext
+	var gitRoot string
+	if rc, err := beads.GetRepoContext(); err == nil {
+		gitRoot = rc.RepoRoot
+	} else {
+		// Fallback to CWD-based lookup
+		gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel") // #nosec G204 -- fixed git invocation for repo root discovery
+		gitRootOutput, err := gitRootCmd.Output()
+		if err != nil {
+			return fmt.Errorf("not in a git repository: %w", err)
+		}
+		gitRoot = strings.TrimSpace(string(gitRootOutput))
 	}
-	gitRoot := strings.TrimSpace(string(gitRootOutput))
 
 	// Convert conflicted path to absolute path relative to git root
 	absConflictedPath := conflictedPath

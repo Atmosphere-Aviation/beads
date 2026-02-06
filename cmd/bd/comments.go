@@ -33,11 +33,24 @@ Examples:
   bd comments add bd-123 -f notes.txt`,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		localTime, _ := cmd.Flags().GetBool("local-time")
 		issueID := args[0]
 
 		comments := make([]*types.Comment, 0)
 		usedDaemon := false
 		if daemonClient != nil {
+			// Resolve short/partial ID to full ID before sending to daemon (#1070)
+			resolveArgs := &rpc.ResolveIDArgs{ID: issueID}
+			resolveResp, err := daemonClient.ResolveID(resolveArgs)
+			if err != nil {
+				FatalErrorRespectJSON("resolving ID %s: %v", issueID, err)
+			}
+			var resolvedID string
+			if err := json.Unmarshal(resolveResp.Data, &resolvedID); err != nil {
+				FatalErrorRespectJSON("unmarshaling resolved ID: %v", err)
+			}
+			issueID = resolvedID
+
 			resp, err := daemonClient.ListComments(&rpc.CommentListArgs{ID: issueID})
 			if err != nil {
 				if isUnknownOperationError(err) {
@@ -79,11 +92,7 @@ Examples:
 		}
 
 		if jsonOutput {
-			data, err := json.MarshalIndent(comments, "", "  ")
-			if err != nil {
-				FatalErrorRespectJSON("encoding JSON: %v", err)
-			}
-			fmt.Println(string(data))
+			outputJSON(comments)
 			return
 		}
 
@@ -95,7 +104,11 @@ Examples:
 
 		fmt.Printf("\nComments on %s:\n\n", issueID)
 		for _, comment := range comments {
-			fmt.Printf("[%s] at %s\n", comment.Author, comment.CreatedAt.Format("2006-01-02 15:04"))
+			ts := comment.CreatedAt
+			if localTime {
+				ts = ts.Local()
+			}
+			fmt.Printf("[%s] at %s\n", comment.Author, ts.Format("2006-01-02 15:04"))
 			rendered := ui.RenderMarkdown(comment.Text)
 			// TrimRight removes trailing newlines that Glamour adds, preventing extra blank lines
 			for _, line := range strings.Split(strings.TrimRight(rendered, "\n"), "\n") {
@@ -145,6 +158,18 @@ Examples:
 
 		var comment *types.Comment
 		if daemonClient != nil {
+			// Resolve short/partial ID to full ID before sending to daemon (#1070)
+			resolveArgs := &rpc.ResolveIDArgs{ID: issueID}
+			resolveResp, err := daemonClient.ResolveID(resolveArgs)
+			if err != nil {
+				FatalErrorRespectJSON("resolving ID %s: %v", issueID, err)
+			}
+			var resolvedID string
+			if err := json.Unmarshal(resolveResp.Data, &resolvedID); err != nil {
+				FatalErrorRespectJSON("unmarshaling resolved ID: %v", err)
+			}
+			issueID = resolvedID
+
 			resp, err := daemonClient.AddComment(&rpc.CommentAddArgs{
 				ID:     issueID,
 				Author: author,
@@ -186,11 +211,7 @@ Examples:
 		}
 
 		if jsonOutput {
-			data, err := json.MarshalIndent(comment, "", "  ")
-			if err != nil {
-				FatalErrorRespectJSON("encoding JSON: %v", err)
-			}
-			fmt.Println(string(data))
+			outputJSON(comment)
 			return
 		}
 
@@ -211,6 +232,7 @@ var commentCmd = &cobra.Command{
 
 func init() {
 	commentsCmd.AddCommand(commentsAddCmd)
+	commentsCmd.Flags().Bool("local-time", false, "Show timestamps in local time instead of UTC")
 	commentsAddCmd.Flags().StringP("file", "f", "", "Read comment text from file")
 	commentsAddCmd.Flags().StringP("author", "a", "", "Add author to comment")
 

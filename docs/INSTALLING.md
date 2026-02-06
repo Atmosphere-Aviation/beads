@@ -17,11 +17,14 @@ Beads has several components - here's what they are and when you need them:
 - The **Plugin** enhances Claude Code with slash commands but *requires* the CLI installed
 - The **MCP server** is an *alternative* to the CLI for environments without shell access
 
+**Important:** Beads is installed system-wide, not cloned into your project. The `.beads/` directory in your project only contains the issue database.
+
 **Typical setups:**
 
 | Environment | What to Install |
 |-------------|-----------------|
 | Claude Code, Cursor, Windsurf | bd CLI (+ optional Plugin for Claude Code) |
+| GitHub Copilot (VS Code) | bd CLI + MCP server |
 | Claude Desktop (no shell) | MCP server only |
 | Terminal / scripts | bd CLI only |
 | CI/CD pipelines | bd CLI only |
@@ -33,8 +36,7 @@ Beads has several components - here's what they are and when you need them:
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Why Homebrew?**
@@ -69,14 +71,38 @@ The installer will:
 
 **TL;DR:** Use Homebrew if available. Use npm if you're in a Node.js environment. Use the script for quick one-off installs or CI.
 
+## Build Dependencies (go install / from source)
+
+If you install via `go install` or build from source, you need system dependencies for CGO:
+
+macOS (Homebrew):
+```bash
+brew install icu4c zstd
+```
+
+Linux (Debian/Ubuntu):
+```bash
+sudo apt-get install -y libicu-dev libzstd-dev
+```
+
+Linux (Fedora/RHEL):
+```bash
+sudo dnf install -y libicu-devel libzstd-devel
+```
+
+If you see `unicode/uregex.h` missing on macOS, `icu4c` is keg-only. Use:
+```bash
+ICU_PREFIX="$(brew --prefix icu4c)"
+CGO_CFLAGS="-I${ICU_PREFIX}/include" CGO_CPPFLAGS="-I${ICU_PREFIX}/include" CGO_LDFLAGS="-L${ICU_PREFIX}/lib" go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
 ## Platform-Specific Installation
 
 ### macOS
 
 **Via Homebrew** (recommended):
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Via go install**:
@@ -96,8 +122,7 @@ sudo mv bd /usr/local/bin/
 
 **Via Homebrew** (works on Linux too):
 ```bash
-brew tap steveyegge/beads
-brew install bd
+brew install beads
 ```
 
 **Arch Linux** (AUR):
@@ -148,6 +173,10 @@ Beads now ships with native Windows support—no MSYS or MinGW required.
 irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
 ```
 
+The script installs a prebuilt Windows release if available. Go is only required for `go install` or building from source.
+
+**Dolt backend on Windows:** Supported. Windows builds use a pure-Go regex backend to avoid ICU/CGO headers. If you need full ICU regex semantics, use Linux/macOS (or WSL) with ICU installed.
+
 **Via go install**:
 ```pwsh
 go install github.com/steveyegge/beads/cmd/bd@latest
@@ -160,6 +189,8 @@ cd beads
 go build -o bd.exe ./cmd/bd
 Move-Item bd.exe $env:USERPROFILE\AppData\Local\Microsoft\WindowsApps\
 ```
+
+If you see `unicode/uregex.h` missing while building, use the PowerShell install script instead (it downloads a prebuilt binary).
 
 **Verify installation**:
 ```pwsh
@@ -179,7 +210,7 @@ bd version
 
 ```bash
 # 1. Install bd CLI (see Quick Install above)
-brew install bd
+brew install beads
 
 # 2. Initialize in your project
 cd your-project
@@ -189,6 +220,7 @@ bd init --quiet
 bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
+bd setup codex    # Codex CLI - creates/updates AGENTS.md
 ```
 
 **How it works:**
@@ -208,6 +240,7 @@ bd setup aider    # Aider - creates .aider.conf.yml
 bd setup claude --check   # Check Claude Code integration
 bd setup cursor --check   # Check Cursor integration
 bd setup aider --check    # Check Aider integration
+bd setup codex --check    # Check Codex integration
 ```
 
 ### Claude Code Plugin (Optional)
@@ -226,6 +259,54 @@ The plugin adds:
 - Task agent for autonomous execution
 
 See [PLUGIN.md](PLUGIN.md) for complete plugin documentation.
+
+### GitHub Copilot (VS Code)
+
+For VS Code with GitHub Copilot:
+
+1. **Install beads-mcp:**
+   ```bash
+   uv tool install beads-mcp
+   ```
+
+2. **Configure MCP** - Create `.vscode/mcp.json` in your project:
+   ```json
+   {
+     "servers": {
+       "beads": {
+         "command": "beads-mcp"
+       }
+     }
+   }
+   ```
+
+   **For all projects:** Add to VS Code user-level MCP config:
+
+   | Platform | Path |
+   |----------|------|
+   | macOS | `~/Library/Application Support/Code/User/mcp.json` |
+   | Linux | `~/.config/Code/User/mcp.json` |
+   | Windows | `%APPDATA%\Code\User\mcp.json` |
+
+   ```json
+   {
+     "servers": {
+       "beads": {
+         "command": "beads-mcp",
+         "args": []
+       }
+     }
+   }
+   ```
+
+3. **Initialize project:**
+   ```bash
+   bd init --quiet
+   ```
+
+4. **Reload VS Code**
+
+See [COPILOT_INTEGRATION.md](COPILOT_INTEGRATION.md) for complete setup guide.
 
 ### MCP Server (Alternative - for MCP-only environments)
 

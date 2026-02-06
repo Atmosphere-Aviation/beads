@@ -106,26 +106,42 @@ type RedirectInfo struct {
 // GetRedirectInfo checks if the current beads directory is redirected.
 // It searches for the local .beads/ directory and checks if it contains a redirect file.
 // Returns RedirectInfo with IsRedirected=true if a redirect is active.
+//
+// bd-wayc3: This function now also checks the git repo's local .beads directory even when
+// BEADS_DIR is set. This handles the case where BEADS_DIR is pre-set to the redirect target
+// (e.g., by shell environment or tooling), but we still need to detect that a redirect exists.
 func GetRedirectInfo() RedirectInfo {
-	info := RedirectInfo{}
-
-	// Find the local .beads directory without following redirects
-	localBeadsDir := findLocalBeadsDir()
-	if localBeadsDir == "" {
-		return info
+	// First, always check the git repo's local .beads directory for redirects
+	// This handles the case where BEADS_DIR is pre-set to the redirect target
+	if localBeadsDir := findLocalBdsDirInRepo(); localBeadsDir != "" {
+		if info := checkRedirectInDir(localBeadsDir); info.IsRedirected {
+			return info
+		}
 	}
-	info.LocalDir = localBeadsDir
+
+	// Fall back to original logic for non-git-repo cases
+	if localBeadsDir := findLocalBeadsDir(); localBeadsDir != "" {
+		return checkRedirectInDir(localBeadsDir)
+	}
+
+	return RedirectInfo{}
+}
+
+// checkRedirectInDir checks if a beads directory has a redirect file and returns redirect info.
+// Returns RedirectInfo with IsRedirected=true if a valid redirect exists.
+func checkRedirectInDir(beadsDir string) RedirectInfo {
+	info := RedirectInfo{LocalDir: beadsDir}
 
 	// Check if this directory has a redirect file
-	redirectFile := filepath.Join(localBeadsDir, RedirectFileName)
+	redirectFile := filepath.Join(beadsDir, RedirectFileName)
 	if _, err := os.Stat(redirectFile); err != nil {
 		// No redirect file
 		return info
 	}
 
 	// There's a redirect - find the target
-	targetDir := FollowRedirect(localBeadsDir)
-	if targetDir == localBeadsDir {
+	targetDir := FollowRedirect(beadsDir)
+	if targetDir == beadsDir {
 		// Redirect file exists but failed to resolve (invalid target)
 		return info
 	}
@@ -133,6 +149,24 @@ func GetRedirectInfo() RedirectInfo {
 	info.IsRedirected = true
 	info.TargetDir = targetDir
 	return info
+}
+
+// findLocalBdsDirInRepo finds the .beads directory relative to the git repo root.
+// This ignores BEADS_DIR to find the "true local" .beads for redirect detection.
+// bd-wayc3: Added to detect redirects even when BEADS_DIR is pre-set.
+func findLocalBdsDirInRepo() string {
+	// Get git repo root
+	repoRoot := git.GetRepoRoot()
+	if repoRoot == "" {
+		return ""
+	}
+
+	beadsDir := filepath.Join(repoRoot, ".beads")
+	if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+		return beadsDir
+	}
+
+	return ""
 }
 
 // findLocalBeadsDir finds the local .beads directory without following redirects.
@@ -181,7 +215,10 @@ func findLocalBeadsDir() string {
 
 // findDatabaseInBeadsDir searches for a database file within a .beads directory.
 // It implements the standard search order:
-// 1. Check config.json first (single source of truth)
+// 1. Check metadata.json first (single source of truth)
+//   - For SQLite backend: returns path to .db file
+//   - For Dolt backend: returns path to dolt/ directory
+//
 // 2. Fall back to canonical beads.db
 // 3. Search for *.db files, filtering out backups and vc.db
 //
@@ -191,11 +228,18 @@ func findLocalBeadsDir() string {
 //
 // Returns empty string if no database is found.
 func findDatabaseInBeadsDir(beadsDir string, warnOnIssues bool) string {
-	// Check for config.json first (single source of truth)
+	// Check for metadata.json first (single source of truth)
 	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
-		dbPath := cfg.DatabasePath(beadsDir)
-		if _, err := os.Stat(dbPath); err == nil {
-			return dbPath
+		backend := cfg.GetBackend()
+		if backend == configfile.BackendDolt {
+			// For Dolt server mode, database is on the server - no local directory required
+			return cfg.DatabasePath(beadsDir)
+		} else {
+			// For SQLite, check if the .db file exists
+			dbPath := cfg.DatabasePath(beadsDir)
+			if _, err := os.Stat(dbPath); err == nil {
+				return dbPath
+			}
 		}
 	}
 
@@ -295,14 +339,13 @@ const (
 	StatusClosed     = types.StatusClosed
 )
 
-// IssueType constants
+// IssueType constants (core types only - Gas Town types removed)
 const (
-	TypeBug      = types.TypeBug
-	TypeFeature  = types.TypeFeature
-	TypeTask     = types.TypeTask
-	TypeEpic     = types.TypeEpic
-	TypeChore    = types.TypeChore
-	TypeMolecule = types.TypeMolecule
+	TypeBug     = types.TypeBug
+	TypeFeature = types.TypeFeature
+	TypeTask    = types.TypeTask
+	TypeEpic    = types.TypeEpic
+	TypeChore   = types.TypeChore
 )
 
 // DependencyType constants
@@ -344,9 +387,24 @@ type Storage = storage.Storage
 type Transaction = storage.Transaction
 
 // NewSQLiteStorage opens a bd SQLite database for programmatic access.
-// Most extensions should use this to query ready work and update issue status.
+// This function explicitly uses SQLite regardless of configuration.
+//
+// Note: This bypasses backend configuration. If your .beads directory is
+// configured to use Dolt, this will still open SQLite (and likely fail or
+// access wrong data). For most use cases, callers should use storage/factory
+// package to respect backend configuration.
 func NewSQLiteStorage(ctx context.Context, dbPath string) (Storage, error) {
 	return sqlite.New(ctx, dbPath)
+}
+
+// GetConfiguredBackend returns the backend type from the beads directory config.
+// Returns "sqlite" if no config exists or backend is not specified.
+func GetConfiguredBackend(beadsDir string) string {
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return configfile.BackendSQLite
+	}
+	return cfg.GetBackend()
 }
 
 // FindDatabasePath discovers the bd database path using bd's standard search order:
@@ -529,9 +587,9 @@ func FindJSONLPath(dbPath string) string {
 
 // DatabaseInfo contains information about a discovered beads database
 type DatabaseInfo struct {
-	Path      string // Full path to the .db file
-	BeadsDir  string // Parent .beads directory
-	IssueCount int   // Number of issues (-1 if unknown)
+	Path       string // Full path to the .db file
+	BeadsDir   string // Parent .beads directory
+	IssueCount int    // Number of issues (-1 if unknown)
 }
 
 // findGitRoot returns the root directory of the current git repository,
@@ -674,13 +732,20 @@ func FindAllDatabases() []DatabaseInfo {
 				issueCount := -1
 				// Don't fail if we can't open/query the database - it might be locked
 				// or corrupted, but we still want to detect and warn about it
-				ctx := context.Background()
-				store, err := sqlite.New(ctx, dbPath)
-				if err == nil {
-					if issues, err := store.SearchIssues(ctx, "", types.IssueFilter{}); err == nil {
-						issueCount = len(issues)
+				//
+				// Note: We only count for SQLite backend. For Dolt, we skip counting
+				// due to import cycle constraints (beads package cannot import factory).
+				// Callers needing Dolt support should use storage/factory directly.
+				backend := GetConfiguredBackend(beadsDir)
+				if backend == configfile.BackendSQLite {
+					ctx := context.Background()
+					store, err := sqlite.New(ctx, dbPath)
+					if err == nil {
+						if issues, err := store.SearchIssues(ctx, "", types.IssueFilter{}); err == nil {
+							issueCount = len(issues)
+						}
+						_ = store.Close()
 					}
-					_ = store.Close()
 				}
 
 				databases = append(databases, DatabaseInfo{

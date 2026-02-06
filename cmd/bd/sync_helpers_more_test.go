@@ -12,14 +12,44 @@ import (
 )
 
 func TestBuildGitCommitArgs_ConfigOptions(t *testing.T) {
-	if err := config.Initialize(); err != nil {
-		t.Fatalf("config.Initialize: %v", err)
-	}
+	initConfigForTest(t)
 	config.Set("git.author", "Test User <test@example.com>")
 	config.Set("git.no-gpg-sign", true)
 
 	args := buildGitCommitArgs("/repo", "hello", "--", ".beads")
 	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--author") {
+		t.Fatalf("expected --author in args: %v", args)
+	}
+	if !strings.Contains(joined, "--no-gpg-sign") {
+		t.Fatalf("expected --no-gpg-sign in args: %v", args)
+	}
+	if !strings.Contains(joined, "-m hello") {
+		t.Fatalf("expected message in args: %v", args)
+	}
+	// buildGitCommitArgs includes -C for raw exec.Command
+	if !strings.HasPrefix(joined, "-C /repo commit") {
+		t.Fatalf("expected -C /repo prefix in args: %v", args)
+	}
+}
+
+func TestBuildCommitArgs_ForRepoContext(t *testing.T) {
+	// buildCommitArgs is for use with RepoContext.GitCmd() which sets cmd.Dir,
+	// so it should NOT include the -C flag.
+	initConfigForTest(t)
+	config.Set("git.author", "Test User <test@example.com>")
+	config.Set("git.no-gpg-sign", true)
+
+	args := buildCommitArgs("hello", "--", ".beads")
+	joined := strings.Join(args, " ")
+
+	// Should start with "commit", not "-C"
+	if !strings.HasPrefix(joined, "commit") {
+		t.Fatalf("expected to start with 'commit', got: %v", args)
+	}
+	if strings.Contains(joined, "-C") {
+		t.Fatalf("buildCommitArgs should NOT contain -C (RepoContext sets cmd.Dir): %v", args)
+	}
 	if !strings.Contains(joined, "--author") {
 		t.Fatalf("expected --author in args: %v", args)
 	}
@@ -35,9 +65,7 @@ func TestGitCommitBeadsDir_PathspecDoesNotCommitOtherStagedFiles(t *testing.T) {
 	_, cleanup := setupGitRepo(t)
 	defer cleanup()
 
-	if err := config.Initialize(); err != nil {
-		t.Fatalf("config.Initialize: %v", err)
-	}
+	initConfigForTest(t)
 
 	if err := os.MkdirAll(".beads", 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)

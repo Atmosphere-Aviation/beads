@@ -13,16 +13,21 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
+
+// tempFileCounter provides unique IDs for concurrent temp file creation
+var tempFileCounter atomic.Uint64
 
 // outputJSON outputs data as pretty-printed JSON
 func outputJSON(v interface{}) {
@@ -57,6 +62,12 @@ func outputJSONError(err error, code string) {
 // the parent directory exists. Uses beads.FindJSONLPath() for discovery (checking
 // BEADS_JSONL env var first, then using .beads/issues.jsonl next to the database).
 //
+// GH#1103: When sync-branch is configured, returns the worktree JSONL path instead
+// of the main repo JSONL. This ensures all writes go only to the worktree, and the
+// main repo's JSONL is only updated via merges from the sync branch. This fixes
+// "local changes would be overwritten by merge" errors caused by daemon writes to
+// main's JSONL while skip-worktree is set.
+//
 // Creates the .beads directory if it doesn't exist (important for new databases).
 // If directory creation fails, returns the path anyway - the subsequent write will
 // fail with a clearer error message.
@@ -80,26 +91,82 @@ func findJSONLPath() string {
 		jsonlPath = utils.FindJSONLInDir(beadsDir)
 	}
 
+	// GH#1103: If sync-branch is configured, redirect to worktree JSONL path.
+	// This ensures writes go ONLY to the worktree, not the main repo.
+	// getWorktreeJSONLPath returns "" if sync-branch isn't configured or worktree doesn't exist.
+	worktreePath := getWorktreeJSONLPath(jsonlPath)
+	if worktreePath != "" {
+		jsonlPath = worktreePath
+	}
+
 	// Ensure the directory exists (important for new databases)
 	// This is the only difference from the public API - we create the directory
 	dbDir := filepath.Dir(jsonlPath)
 	if err := os.MkdirAll(dbDir, 0750); err != nil {
 		// If we can't create the directory, return discovered path anyway
 		// (the subsequent write will fail with a clearer error)
-		return canonicalizeIfRelative(jsonlPath)
+		return utils.CanonicalizeIfRelative(jsonlPath)
 	}
 
-	return canonicalizeIfRelative(jsonlPath)
+	return utils.CanonicalizeIfRelative(jsonlPath)
 }
 
-// canonicalizeIfRelative ensures path is absolute for filepath.Rel() compatibility.
-// Guards against any code path that might set dbPath to relative.
-// See GH#959 for root cause analysis.
-func canonicalizeIfRelative(path string) string {
-	if path != "" && !filepath.IsAbs(path) {
-		return utils.CanonicalizePath(path)
+// getWorktreeJSONLPath converts a main repo JSONL path to its worktree equivalent.
+// Returns empty string if worktree path cannot be determined or worktree doesn't exist.
+// GH#1103: Used by findJSONLPath to redirect writes to the worktree when sync-branch configured.
+func getWorktreeJSONLPath(mainJSONLPath string) string {
+	ctx := context.Background()
+
+	// Get sync branch name
+	syncBranch := syncbranch.GetFromYAML()
+	if syncBranch == "" {
+		return ""
 	}
-	return path
+
+	// Get repo context to determine repo root
+	rc, err := beads.GetRepoContext()
+	if err != nil {
+		// Can't get repo context - not in a git repo or other error
+		return ""
+	}
+
+	// Important: Check if the main JSONL path is actually within this repo.
+	// In tests, the JSONL might be in a temp dir that's not part of the CWD's repo.
+	if !strings.HasPrefix(mainJSONLPath, rc.RepoRoot) {
+		// JSONL is outside this repo - don't redirect to worktree
+		return ""
+	}
+
+	// Get worktree path for sync branch
+	// Use same logic as syncbranch.getBeadsWorktreePath
+	cmd := rc.GitCmd(ctx, "rev-parse", "--git-common-dir")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	gitCommonDir := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(gitCommonDir) {
+		gitCommonDir = filepath.Join(rc.RepoRoot, gitCommonDir)
+	}
+	worktreePath := filepath.Join(gitCommonDir, "beads-worktrees", syncBranch)
+
+	// Check if worktree exists (should have been created by syncbranch.EnsureWorktree
+	// during initialization). If it doesn't exist, fall back to main repo JSONL.
+	// GH#1349: This fallback should now be rare since EnsureWorktree is called early.
+	if _, err := os.Stat(worktreePath); os.IsNotExist(err) {
+		debug.Logf("sync-branch configured but worktree doesn't exist at %s, falling back to main JSONL", worktreePath)
+		return ""
+	}
+
+	// Convert main JSONL path to relative path from repo root
+	jsonlRelPath, err := filepath.Rel(rc.RepoRoot, mainJSONLPath)
+	if err != nil {
+		return ""
+	}
+
+	// Construct worktree JSONL path
+	return filepath.Join(worktreePath, jsonlRelPath)
 }
 
 // detectPrefixFromJSONL extracts the issue prefix from JSONL data.
@@ -139,6 +206,10 @@ func detectPrefixFromJSONL(jsonlData []byte) string {
 // Hash-based comparison is git-proof (mtime comparison fails after git pull).
 // Uses collision detection to prevent silently overwriting local changes.
 // Defense-in-depth check to respect --no-auto-import flag.
+//
+// Thread-safety: Acquires a shared JSONL lock to prevent reading while another
+// process is writing. This fixes the race condition where auto-import could read
+// a partially-written JSONL file during export (SECURITY_AUDIT.md Issue #3).
 func autoImportIfNewer() {
 	// Defense-in-depth: always check noAutoImport flag directly
 	// This ensures auto-import is disabled even if caller forgot to check autoImportEnabled
@@ -147,8 +218,37 @@ func autoImportIfNewer() {
 		return
 	}
 
+	// Skip JSONL import in dolt-native mode — there is no JSONL to import.
+	// Without this guard, the store.GetMetadata call below can panic with a nil
+	// pointer when the Dolt backend connection is in a degraded state.
+	if store != nil && !ShouldImportJSONL(rootCtx, store) {
+		debug.Logf("auto-import skipped (dolt-native mode, no JSONL)")
+		return
+	}
+
 	// Find JSONL path
 	jsonlPath := findJSONLPath()
+	if jsonlPath == "" {
+		debug.Logf("auto-import skipped, JSONL path not found")
+		return
+	}
+
+	beadsDir := filepath.Dir(jsonlPath)
+
+	// Acquire shared lock before reading JSONL to prevent reading during write
+	// This fixes the race condition where auto-import could read partially-written JSONL
+	lock := newJSONLLock(beadsDir)
+	locked, err := lock.TryAcquireShared()
+	if err != nil {
+		debug.Logf("auto-import skipped, failed to acquire shared lock: %v", err)
+		return
+	}
+	if !locked {
+		// Another process is writing - skip auto-import, will retry on next command
+		debug.Logf("auto-import skipped, JSONL lock held by another process (export in progress)")
+		return
+	}
+	defer func() { _ = lock.Release() }()
 
 	// Read JSONL file
 	jsonlData, err := os.ReadFile(jsonlPath)
@@ -192,8 +292,14 @@ func autoImportIfNewer() {
 	if store != nil {
 		prefix, prefixErr := store.GetConfig(ctx, "issue_prefix")
 		if prefixErr != nil || prefix == "" {
-			// Database needs initialization - detect prefix from JSONL or directory
-			detectedPrefix := detectPrefixFromJSONL(jsonlData)
+			// GH#1145: Check config.yaml for issue-prefix before auto-detecting
+			detectedPrefix := config.GetString("issue-prefix")
+
+			// If config.yaml doesn't have it, try to detect from JSONL
+			if detectedPrefix == "" {
+				detectedPrefix = detectPrefixFromJSONL(jsonlData)
+			}
+
 			if detectedPrefix == "" {
 				// Fallback: detect from directory name
 				beadsDir := filepath.Dir(jsonlPath)
@@ -277,7 +383,7 @@ func autoImportIfNewer() {
 	if err := store.ClearAllExportHashes(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to clear export_hashes before import: %v\n", err)
 	}
-	
+
 	// Use shared import logic
 	opts := ImportOptions{
 		DryRun:               false,
@@ -357,8 +463,6 @@ func autoImportIfNewer() {
 	}
 }
 
-
-
 // markDirtyAndScheduleFlush marks the database as dirty and schedules a flush
 // markDirtyAndScheduleFlush marks the database as dirty and schedules a debounced
 // export to JSONL. Uses FlushManager's event-driven architecture.
@@ -370,9 +474,12 @@ func autoImportIfNewer() {
 // Flush-on-exit guarantee: PersistentPostRun calls flushManager.Shutdown() which
 // performs a final flush before the command exits, ensuring no data is lost.
 //
-// Thread-safe: Safe to call from multiple goroutines (no shared mutable state).
+// Thread-safe: Safe to call from multiple goroutines (uses atomic.Bool).
 // No-op if auto-flush is disabled via --no-auto-flush flag.
 func markDirtyAndScheduleFlush() {
+	// Track that this command performed a write (atomic to avoid data races).
+	commandDidWrite.Store(true)
+
 	// Use FlushManager if available
 	// No FlushManager means sandbox mode or test without flush setup - no-op is correct
 	if flushManager != nil {
@@ -382,6 +489,9 @@ func markDirtyAndScheduleFlush() {
 
 // markDirtyAndScheduleFullExport marks DB as needing a full export (for ID-changing operations)
 func markDirtyAndScheduleFullExport() {
+	// Track that this command performed a write (atomic to avoid data races).
+	commandDidWrite.Store(true)
+
 	// Use FlushManager if available
 	// No FlushManager means sandbox mode or test without flush setup - no-op is correct
 	if flushManager != nil {
@@ -407,11 +517,11 @@ func clearAutoFlushState() {
 //
 // Atomic write pattern:
 //
-//	1. Create temp file with PID suffix: issues.jsonl.tmp.12345
-//	2. Write all issues as JSONL to temp file
-//	3. Close temp file
-//	4. Atomic rename: temp → target
-//	5. Set file permissions to 0644
+//  1. Create temp file with PID suffix: issues.jsonl.tmp.12345
+//  2. Write all issues as JSONL to temp file
+//  3. Close temp file
+//  4. Atomic rename: temp → target
+//  5. Set file permissions to 0644
 //
 // Error handling: Returns error on any failure. Cleanup is guaranteed via defer.
 // Thread-safe: No shared state access. Safe to call from multiple goroutines.
@@ -424,12 +534,12 @@ func validateJSONLIntegrity(ctx context.Context, jsonlPath string) (bool, error)
 	if err != nil {
 		return false, fmt.Errorf("failed to get stored JSONL hash: %w", err)
 	}
-	
+
 	// If no hash stored, this is first export - skip validation
 	if storedHash == "" {
 		return false, nil
 	}
-	
+
 	// Read current JSONL file
 	jsonlData, err := os.ReadFile(jsonlPath)
 	if err != nil {
@@ -447,12 +557,12 @@ func validateJSONLIntegrity(ctx context.Context, jsonlPath string) (bool, error)
 		}
 		return false, fmt.Errorf("failed to read JSONL file: %w", err)
 	}
-	
+
 	// Compute current JSONL hash
 	hasher := sha256.New()
 	hasher.Write(jsonlData)
 	currentHash := hex.EncodeToString(hasher.Sum(nil))
-	
+
 	// Compare hashes
 	if currentHash != storedHash {
 		fmt.Fprintf(os.Stderr, "⚠️  WARNING: JSONL file hash mismatch detected\n")
@@ -469,7 +579,7 @@ func validateJSONLIntegrity(ctx context.Context, jsonlPath string) (bool, error)
 		}
 		return true, nil // Signal full export needed
 	}
-	
+
 	return false, nil
 }
 
@@ -479,8 +589,10 @@ func writeJSONLAtomic(jsonlPath string, issues []*types.Issue) ([]string, error)
 		return cmp.Compare(a.ID, b.ID)
 	})
 
-	// Create temp file with PID suffix to avoid collisions
-	tempPath := fmt.Sprintf("%s.tmp.%d", jsonlPath, os.Getpid())
+	// Create temp file with unique suffix to avoid collisions between concurrent writers
+	// Uses PID + atomic counter to ensure uniqueness within and across processes
+	tempID := tempFileCounter.Add(1)
+	tempPath := fmt.Sprintf("%s.tmp.%d.%d", jsonlPath, os.Getpid(), tempID)
 	f, err := os.Create(tempPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
@@ -498,15 +610,15 @@ func writeJSONLAtomic(jsonlPath string, issues []*types.Issue) ([]string, error)
 	encoder := json.NewEncoder(f)
 	skippedCount := 0
 	exportedIDs := make([]string, 0, len(issues))
-	
+
 	for _, issue := range issues {
 		if err := encoder.Encode(issue); err != nil {
-		 return nil, fmt.Errorf("failed to encode issue %s: %w", issue.ID, err)
+			return nil, fmt.Errorf("failed to encode issue %s: %w", issue.ID, err)
 		}
-		
+
 		exportedIDs = append(exportedIDs, issue.ID)
 	}
-	
+
 	// Report skipped issues if any (helps debugging)
 	if skippedCount > 0 {
 		debug.Logf("auto-flush skipped %d issue(s) with timestamp-only changes", skippedCount)
@@ -665,10 +777,13 @@ func filterByMultiRepoPrefix(ctx context.Context, s storage.Storage, issues []*t
 		return issues
 	}
 
-	// Get our configured prefix
+	// Get our configured prefix (GH#1145: fallback to config.yaml)
 	prefix, prefixErr := s.GetConfig(ctx, "issue_prefix")
 	if prefixErr != nil || prefix == "" {
-		return issues
+		prefix = config.GetString("issue-prefix")
+		if prefix == "" {
+			return issues
+		}
 	}
 
 	// Determine if we're the primary repo
@@ -754,6 +869,7 @@ type flushState struct {
 //   - Store already closed (storeActive=false)
 //   - Database not dirty (isDirty=false) AND forceDirty=false
 //   - No dirty issues found (incremental mode only)
+//   - Sync mode is dolt-native (bd-ixip: skip JSONL export)
 func flushToJSONLWithState(state flushState) {
 	// Check if store is still active (not closed) and not nil
 	storeMutex.Lock()
@@ -763,7 +879,34 @@ func flushToJSONLWithState(state flushState) {
 	}
 	storeMutex.Unlock()
 
+	// Check sync mode before JSONL export (bd-ixip: dolt-native mode should skip JSONL)
+	ctx := rootCtx
+	if !ShouldExportJSONL(ctx, store) {
+		debug.Logf("skipping autoflush (dolt-native mode)")
+		return
+	}
+
 	jsonlPath := findJSONLPath()
+	if jsonlPath == "" {
+		return
+	}
+
+	// Acquire exclusive JSONL lock before reading/writing
+	// This prevents race conditions between concurrent flush operations and imports
+	// (SECURITY_AUDIT.md Issue #1, fixes TestExportImportRace_ConcurrentOperations)
+	beadsDir := filepath.Dir(jsonlPath)
+	lock := newJSONLLock(beadsDir)
+	locked, err := lock.TryAcquireExclusive()
+	if err != nil {
+		debug.Logf("auto-flush: failed to acquire exclusive lock: %v", err)
+		return
+	}
+	if !locked {
+		// Another process is writing - skip this flush, will retry later
+		debug.Logf("auto-flush: JSONL lock held by another process, skipping")
+		return
+	}
+	defer func() { _ = lock.Release() }()
 
 	// Double-check store is still active before accessing
 	storeMutex.Lock()
@@ -772,8 +915,6 @@ func flushToJSONLWithState(state flushState) {
 		return
 	}
 	storeMutex.Unlock()
-
-	ctx := rootCtx
 
 	// Validate JSONL integrity BEFORE checking isDirty
 	// This detects if JSONL and export_hashes are out of sync (e.g., after git operations)
@@ -846,6 +987,14 @@ func flushToJSONLWithState(state flushState) {
 
 	// Update metadata (hashes, timestamps)
 	updateFlushExportMetadata(ctx, store, jsonlPath)
+
+	// Export events to JSONL (non-fatal, opt-in via config)
+	if config.GetBool("events-export") {
+		eventsPath := filepath.Join(filepath.Dir(jsonlPath), "events.jsonl")
+		if err := exportEventsToJSONL(ctx, store, eventsPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: events export failed: %v\n", err)
+		}
+	}
 
 	recordFlushSuccess()
 }

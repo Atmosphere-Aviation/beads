@@ -48,7 +48,7 @@ func (s *Server) checkVersionCompatibility(clientVersion string) error {
 		cmp := semver.Compare(serverVer, clientVer)
 		if cmp < 0 {
 			// Daemon is older - needs upgrade
-			return fmt.Errorf("incompatible major versions: client %s, daemon %s. Daemon is older; upgrade and restart daemon: 'bd daemon --stop && bd daemon'",
+			return fmt.Errorf("incompatible major versions: client %s, daemon %s. Daemon is older; upgrade and restart daemon: 'bd daemon stop && bd daemon start'",
 				clientVersion, ServerVersion)
 		}
 		// Daemon is newer - client needs upgrade
@@ -150,7 +150,7 @@ func (s *Server) handleRequest(req *Request) Response {
 	// Skip for write operations that will trigger export anyway
 	// Skip for import operation itself to avoid recursion
 	if req.Operation != OpPing && req.Operation != OpHealth && req.Operation != OpMetrics && 
-	   req.Operation != OpImport && req.Operation != OpExport {
+	   req.Operation != OpExport {
 		if err := s.checkAndAutoImportIfStale(req); err != nil {
 			// Log warning but continue - don't fail the request
 			fmt.Fprintf(os.Stderr, "Warning: staleness check failed: %v\n", err)
@@ -215,8 +215,6 @@ func (s *Server) handleRequest(req *Request) Response {
 		resp = s.handleCompactStats(req)
 	case OpExport:
 		resp = s.handleExport(req)
-	case OpImport:
-		resp = s.handleImport(req)
 	case OpEpicStatus:
 		resp = s.handleEpicStatus(req)
 	case OpGetMutations:
@@ -263,9 +261,8 @@ func (s *Server) handleRequest(req *Request) Response {
 // reqCtx returns a context with the server's request timeout applied.
 // This prevents request handlers from hanging indefinitely if database
 // operations or other internal calls stall (GH#bd-p76kv).
-func (s *Server) reqCtx(_ *Request) context.Context {
-	ctx, _ := context.WithTimeout(context.Background(), s.requestTimeout)
-	return ctx
+func (s *Server) reqCtx(_ *Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), s.requestTimeout)
 }
 
 func (s *Server) reqActor(req *Request) string {
@@ -407,7 +404,8 @@ func (s *Server) handleMetrics(_ *Request) Response {
 }
 
 func (s *Server) handleGetWorkerStatus(req *Request) Response {
-	ctx := s.reqCtx(req)
+	ctx, cancel := s.reqCtx(req)
+	defer cancel()
 
 	// Parse optional args
 	var args GetWorkerStatusArgs

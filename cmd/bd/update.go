@@ -4,14 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/rpc"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/util"
 	"github.com/steveyegge/beads/internal/validation"
 )
 
@@ -77,9 +80,16 @@ create, update, show, or close operation).`,
 			design, _ := cmd.Flags().GetString("design")
 			updates["design"] = design
 		}
+		if cmd.Flags().Changed("notes") && cmd.Flags().Changed("append-notes") {
+			FatalErrorRespectJSON("cannot specify both --notes and --append-notes")
+		}
 		if cmd.Flags().Changed("notes") {
 			notes, _ := cmd.Flags().GetString("notes")
 			updates["notes"] = notes
+		}
+		if cmd.Flags().Changed("append-notes") {
+			appendNotes, _ := cmd.Flags().GetString("append-notes")
+			updates["append_notes"] = appendNotes
 		}
 		if cmd.Flags().Changed("acceptance") || cmd.Flags().Changed("acceptance-criteria") {
 			var acceptanceCriteria string
@@ -94,6 +104,10 @@ create, update, show, or close operation).`,
 			externalRef, _ := cmd.Flags().GetString("external-ref")
 			updates["external_ref"] = externalRef
 		}
+		if cmd.Flags().Changed("spec-id") {
+			specID, _ := cmd.Flags().GetString("spec-id")
+			updates["spec_id"] = specID
+		}
 		if cmd.Flags().Changed("estimate") {
 			estimate, _ := cmd.Flags().GetInt("estimate")
 			if estimate < 0 {
@@ -103,9 +117,28 @@ create, update, show, or close operation).`,
 		}
 		if cmd.Flags().Changed("type") {
 			issueType, _ := cmd.Flags().GetString("type")
-			// Validate issue type
-			if !types.IssueType(issueType).IsValid() {
-				FatalErrorRespectJSON("invalid issue type %q. Valid types: bug, feature, task, epic, chore, merge-request, molecule, gate, agent, role, rig, convoy, event, slot", issueType)
+			// Normalize aliases (e.g., "enhancement" -> "feature") before validating
+			issueType = util.NormalizeIssueType(issueType)
+			// In daemon mode, skip client-side type pre-validation.
+			// The daemon validates authoritatively with database access (GH#1499).
+			if daemonClient == nil {
+				var customTypes []string
+				if store != nil {
+					if ct, err := store.GetCustomTypes(cmd.Context()); err == nil {
+						customTypes = ct
+					}
+				}
+				// Fallback to config.yaml when store returns no custom types.
+				if len(customTypes) == 0 {
+					customTypes = config.GetCustomTypesFromYAML()
+				}
+				if !types.IssueType(issueType).IsValidWithCustom(customTypes) {
+					validTypes := "bug, feature, task, epic, chore"
+					if len(customTypes) > 0 {
+						validTypes += ", " + joinStrings(customTypes, ", ")
+					}
+					FatalErrorRespectJSON("invalid issue type %q. Valid types: %s", issueType, validTypes)
+				}
 			}
 			updates["issue_type"] = issueType
 		}
@@ -124,14 +157,6 @@ create, update, show, or close operation).`,
 		if cmd.Flags().Changed("parent") {
 			parent, _ := cmd.Flags().GetString("parent")
 			updates["parent"] = parent
-		}
-		if cmd.Flags().Changed("type") {
-			issueType, _ := cmd.Flags().GetString("type")
-			// Validate issue type
-			if _, err := validation.ParseIssueType(issueType); err != nil {
-				FatalErrorRespectJSON("%v", err)
-			}
-			updates["issue_type"] = issueType
 		}
 		// Gate fields (bd-z6kw)
 		if cmd.Flags().Changed("await-id") {
@@ -170,6 +195,41 @@ create, update, show, or close operation).`,
 				}
 				updates["defer_until"] = t
 			}
+		}
+		// Ephemeral/persistent flags
+		// Note: storage layer uses "wisp" field name, maps to "ephemeral" column
+		ephemeralChanged := cmd.Flags().Changed("ephemeral")
+		persistentChanged := cmd.Flags().Changed("persistent")
+		if ephemeralChanged && persistentChanged {
+			FatalErrorRespectJSON("cannot specify both --ephemeral and --persistent flags")
+		}
+		if ephemeralChanged {
+			updates["wisp"] = true
+		}
+		if persistentChanged {
+			updates["wisp"] = false
+		}
+		// Metadata flag (GH#1413)
+		if cmd.Flags().Changed("metadata") {
+			metadataValue, _ := cmd.Flags().GetString("metadata")
+			var metadataJSON string
+			if strings.HasPrefix(metadataValue, "@") {
+				// Read JSON from file
+				filePath := metadataValue[1:]
+				// #nosec G304 -- user explicitly provides file path via @file.json syntax
+				data, err := os.ReadFile(filePath)
+				if err != nil {
+					FatalErrorRespectJSON("failed to read metadata file %s: %v", filePath, err)
+				}
+				metadataJSON = string(data)
+			} else {
+				metadataJSON = metadataValue
+			}
+			// Validate JSON
+			if !json.Valid([]byte(metadataJSON)) {
+				FatalErrorRespectJSON("invalid JSON in --metadata: must be valid JSON")
+			}
+			updates["metadata"] = json.RawMessage(metadataJSON)
 		}
 
 		// Get claim flag
@@ -236,11 +296,30 @@ create, update, show, or close operation).`,
 				if notes, ok := updates["notes"].(string); ok {
 					updateArgs.Notes = &notes
 				}
+				if appendNotes, ok := updates["append_notes"].(string); ok {
+					// Fetch existing issue to get current notes
+					showArgs := &rpc.ShowArgs{ID: id}
+					resp, err := daemonClient.Show(showArgs)
+					if err == nil {
+						var existingIssue types.Issue
+						if err := json.Unmarshal(resp.Data, &existingIssue); err == nil {
+							combined := existingIssue.Notes
+							if combined != "" {
+								combined += "\n"
+							}
+							combined += appendNotes
+							updateArgs.Notes = &combined
+						}
+					}
+				}
 				if acceptanceCriteria, ok := updates["acceptance_criteria"].(string); ok {
 					updateArgs.AcceptanceCriteria = &acceptanceCriteria
 				}
 				if externalRef, ok := updates["external_ref"].(string); ok {
 					updateArgs.ExternalRef = &externalRef
+				}
+				if specID, ok := updates["spec_id"].(string); ok {
+					updateArgs.SpecID = &specID
 				}
 				if estimate, ok := updates["estimated_minutes"].(int); ok {
 					updateArgs.EstimatedMinutes = &estimate
@@ -283,6 +362,15 @@ create, update, show, or close operation).`,
 					// Explicit clear
 					empty := ""
 					updateArgs.DeferUntil = &empty
+				}
+				// Ephemeral/persistent
+				if wisp, ok := updates["wisp"].(bool); ok {
+					updateArgs.Ephemeral = &wisp
+				}
+				// Metadata (GH#1413)
+				if metadata, ok := updates["metadata"].(json.RawMessage); ok {
+					metadataStr := string(metadata)
+					updateArgs.Metadata = &metadataStr
 				}
 
 				// Set claim flag for atomic claim operation
@@ -361,9 +449,18 @@ create, update, show, or close operation).`,
 				// Apply regular field updates if any
 				regularUpdates := make(map[string]interface{})
 				for k, v := range updates {
-					if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" {
+					if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" {
 						regularUpdates[k] = v
 					}
+				}
+				// Handle append_notes: combine existing notes with new content
+				if appendNotes, ok := updates["append_notes"].(string); ok {
+					combined := issue.Notes
+					if combined != "" {
+						combined += "\n"
+					}
+					combined += appendNotes
+					regularUpdates["notes"] = combined
 				}
 				if len(regularUpdates) > 0 {
 					if err := issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor); err != nil {
@@ -452,20 +549,9 @@ create, update, show, or close operation).`,
 				continue
 			}
 
-			// Handle claim operation atomically
+			// Handle claim operation atomically using compare-and-swap semantics
 			if claimFlag {
-				// Check if already claimed (has non-empty assignee)
-				if issue.Assignee != "" {
-					fmt.Fprintf(os.Stderr, "Error claiming %s: already claimed by %s\n", id, issue.Assignee)
-					result.Close()
-					continue
-				}
-				// Atomically set assignee and status
-				claimUpdates := map[string]interface{}{
-					"assignee": actor,
-					"status":   "in_progress",
-				}
-				if err := issueStore.UpdateIssue(ctx, result.ResolvedID, claimUpdates, actor); err != nil {
+				if err := issueStore.ClaimIssue(ctx, result.ResolvedID, actor); err != nil {
 					fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
 					result.Close()
 					continue
@@ -475,9 +561,18 @@ create, update, show, or close operation).`,
 			// Apply regular field updates if any
 			regularUpdates := make(map[string]interface{})
 			for k, v := range updates {
-				if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" {
+				if k != "add_labels" && k != "remove_labels" && k != "set_labels" && k != "parent" && k != "append_notes" {
 					regularUpdates[k] = v
 				}
+			}
+			// Handle append_notes: combine existing notes with new content
+			if appendNotes, ok := updates["append_notes"].(string); ok {
+				combined := issue.Notes
+				if combined != "" {
+					combined += "\n"
+				}
+				combined += appendNotes
+				regularUpdates["notes"] = combined
 			}
 			if len(regularUpdates) > 0 {
 				if err := issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor); err != nil {
@@ -597,6 +692,7 @@ func init() {
 	updateCmd.Flags().String("title", "", "New title")
 	updateCmd.Flags().StringP("type", "t", "", "New type (bug|feature|task|epic|chore|merge-request|molecule|gate|agent|role|rig|convoy|event|slot)")
 	registerCommonIssueFlags(updateCmd)
+	updateCmd.Flags().String("spec-id", "", "Link to specification document")
 	updateCmd.Flags().String("acceptance-criteria", "", "DEPRECATED: use --acceptance")
 	_ = updateCmd.Flags().MarkHidden("acceptance-criteria") // Only fails if flag missing (caught in tests)
 	updateCmd.Flags().IntP("estimate", "e", 0, "Time estimate in minutes (e.g., 60 for 1 hour)")
@@ -619,6 +715,11 @@ func init() {
 	updateCmd.Flags().String("defer", "", "Defer until date (empty to clear). Issue hidden from bd ready until then")
 	// Gate fields (bd-z6kw)
 	updateCmd.Flags().String("await-id", "", "Set gate await_id (e.g., GitHub run ID for gh:run gates)")
+	// Ephemeral/persistent flags
+	updateCmd.Flags().Bool("ephemeral", false, "Mark issue as ephemeral (wisp) - not exported to JSONL")
+	updateCmd.Flags().Bool("persistent", false, "Mark issue as persistent (promote wisp to regular issue)")
+	// Metadata flag (GH#1413)
+	updateCmd.Flags().String("metadata", "", "Set custom metadata (JSON string or @file.json to read from file)")
 	updateCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(updateCmd)
 }

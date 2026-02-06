@@ -5,11 +5,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -77,7 +78,7 @@ func findExistingSwarm(ctx context.Context, s SwarmStorage, epicID string) (*typ
 	// Find a swarm molecule with relates-to dependency to this epic
 	for _, dep := range dependents {
 		// Only consider molecules (GetDependents doesn't populate mol_type, so we fetch full issue)
-		if dep.IssueType != types.TypeMolecule {
+		if dep.IssueType != "molecule" {
 			continue
 		}
 
@@ -161,7 +162,7 @@ Examples:
 		if store == nil {
 			if daemonClient != nil {
 				var err error
-				store, err = sqlite.New(ctx, dbPath)
+				store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
 				if err != nil {
 					FatalErrorRespectJSON("failed to open database: %v", err)
 				}
@@ -187,7 +188,7 @@ Examples:
 		}
 
 		// Verify it's an epic
-		if epic.IssueType != types.TypeEpic && epic.IssueType != types.TypeMolecule {
+		if epic.IssueType != types.TypeEpic && epic.IssueType != "molecule" {
 			FatalErrorRespectJSON("'%s' is not an epic or molecule (type: %s)", epicID, epic.IssueType)
 		}
 
@@ -627,7 +628,7 @@ Examples:
 		if store == nil {
 			if daemonClient != nil {
 				var err error
-				store, err = sqlite.New(ctx, dbPath)
+				store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
 				if err != nil {
 					FatalErrorRespectJSON("failed to open database: %v", err)
 				}
@@ -655,7 +656,7 @@ Examples:
 		var epic *types.Issue
 
 		// Check if it's a swarm molecule - if so, follow the link to the epic
-		if issue.IssueType == types.TypeMolecule && issue.MolType == types.MolTypeSwarm {
+		if issue.IssueType == "molecule" && issue.MolType == types.MolTypeSwarm {
 			// Find linked epic via relates-to dependency
 			deps, err := store.GetDependencyRecords(ctx, issue.ID)
 			if err != nil {
@@ -673,7 +674,7 @@ Examples:
 			if epic == nil {
 				FatalErrorRespectJSON("swarm molecule '%s' has no linked epic", issueID)
 			}
-		} else if issue.IssueType == types.TypeEpic || issue.IssueType == types.TypeMolecule {
+		} else if issue.IssueType == types.TypeEpic || issue.IssueType == "molecule" {
 			epic = issue
 		} else {
 			FatalErrorRespectJSON("'%s' is not an epic or swarm molecule (type: %s)", issueID, issue.IssueType)
@@ -921,7 +922,7 @@ Examples:
 		if store == nil {
 			if daemonClient != nil {
 				var err error
-				store, err = sqlite.New(ctx, dbPath)
+				store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
 				if err != nil {
 					FatalErrorRespectJSON("failed to open database: %v", err)
 				}
@@ -950,7 +951,7 @@ Examples:
 		var epicTitle string
 
 		// Check if it's an epic or single issue that needs wrapping
-		if issue.IssueType == types.TypeEpic || issue.IssueType == types.TypeMolecule {
+		if issue.IssueType == types.TypeEpic || issue.IssueType == "molecule" {
 			epicID = issue.ID
 			epicTitle = issue.Title
 		} else {
@@ -1042,7 +1043,7 @@ Examples:
 			Description: fmt.Sprintf("Swarm molecule orchestrating epic %s.\n\nEpic: %s\nCoordinator: %s", epicID, epicID, coordinator),
 			Status:      types.StatusOpen,
 			Priority:    epic.Priority,
-			IssueType:   types.TypeMolecule,
+			IssueType:   "molecule",
 			MolType:     types.MolTypeSwarm,
 			Assignee:    coordinator,
 			CreatedBy:   actor,
@@ -1103,7 +1104,7 @@ Examples:
 		if store == nil {
 			if daemonClient != nil {
 				var err error
-				store, err = sqlite.New(ctx, dbPath)
+				store, err = factory.NewFromConfig(ctx, filepath.Dir(dbPath))
 				if err != nil {
 					FatalErrorRespectJSON("failed to open database: %v", err)
 				}

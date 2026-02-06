@@ -2,14 +2,15 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -77,8 +78,7 @@ Examples:
 		ctx := rootCtx
 		if daemonClient == nil {
 			if err := ensureDatabaseFresh(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalErrorRespectJSON("%v", err)
 			}
 		}
 
@@ -86,21 +86,18 @@ Examples:
 		if daemonClient != nil {
 			resp, rpcErr := daemonClient.Stats()
 			if rpcErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rpcErr)
-				os.Exit(1)
+				FatalErrorRespectJSON("%v", rpcErr)
 			}
 
 			if err := json.Unmarshal(resp.Data, &stats); err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
-				os.Exit(1)
+				FatalErrorRespectJSON("parsing response: %v", err)
 			}
 		} else {
 			// Direct mode
 			ctx := rootCtx
 			stats, err = store.GetStatistics(ctx)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalErrorRespectJSON("%v", err)
 			}
 		}
 
@@ -108,8 +105,7 @@ Examples:
 		if showAssigned {
 			stats = getAssignedStatistics(actor)
 			if stats == nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to get assigned statistics\n")
-				os.Exit(1)
+				FatalErrorRespectJSON("failed to get assigned statistics")
 			}
 		}
 
@@ -178,7 +174,8 @@ Examples:
 	},
 }
 
-// getGitActivity calculates activity stats from git log of issues.jsonl
+// getGitActivity calculates activity stats from git log of issues.jsonl.
+// GH#1110: Now uses RepoContext to ensure git commands run in beads repo.
 func getGitActivity(hours int) *RecentActivitySummary {
 	activity := &RecentActivitySummary{
 		HoursTracked: hours,
@@ -186,7 +183,12 @@ func getGitActivity(hours int) *RecentActivitySummary {
 
 	// Run git log to get patches for the last N hours
 	since := fmt.Sprintf("%d hours ago", hours)
-	cmd := exec.Command("git", "log", "--since="+since, "--numstat", "--pretty=format:%H", ".beads/issues.jsonl") // #nosec G204 -- bounded arguments for local git history inspection
+	var cmd *exec.Cmd
+	if rc, err := beads.GetRepoContext(); err == nil {
+		cmd = rc.GitCmd(context.Background(), "log", "--since="+since, "--numstat", "--pretty=format:%H", ".beads/issues.jsonl")
+	} else {
+		cmd = exec.Command("git", "log", "--since="+since, "--numstat", "--pretty=format:%H", ".beads/issues.jsonl") // #nosec G204 -- bounded arguments for local git history inspection
+	}
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -222,7 +224,11 @@ func getGitActivity(hours int) *RecentActivitySummary {
 	}
 
 	// Get detailed diff to analyze changes
-	cmd = exec.Command("git", "log", "--since="+since, "-p", ".beads/issues.jsonl") // #nosec G204 -- bounded arguments for local git history inspection
+	if rc, err := beads.GetRepoContext(); err == nil {
+		cmd = rc.GitCmd(context.Background(), "log", "--since="+since, "-p", ".beads/issues.jsonl")
+	} else {
+		cmd = exec.Command("git", "log", "--since="+since, "-p", ".beads/issues.jsonl") // #nosec G204 -- bounded arguments for local git history inspection
+	}
 	output, err = cmd.Output()
 	if err != nil {
 		return nil

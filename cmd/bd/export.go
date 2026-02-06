@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/storage/factory"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/util"
@@ -136,6 +137,8 @@ Examples:
 		output, _ := cmd.Flags().GetString("output")
 		statusFilter, _ := cmd.Flags().GetString("status")
 		force, _ := cmd.Flags().GetBool("force")
+		eventsFlag, _ := cmd.Flags().GetBool("events")
+		eventsReset, _ := cmd.Flags().GetBool("events-reset")
 
 		// Additional filter flags
 		assignee, _ := cmd.Flags().GetString("assignee")
@@ -149,6 +152,8 @@ Examples:
 		createdBefore, _ := cmd.Flags().GetString("created-before")
 		updatedAfter, _ := cmd.Flags().GetString("updated-after")
 		updatedBefore, _ := cmd.Flags().GetString("updated-before")
+		idFilter, _ := cmd.Flags().GetString("id")
+		parentID, _ := cmd.Flags().GetString("parent")
 
 		debug.Logf("Debug: export flags - output=%q, force=%v\n", output, force)
 
@@ -181,12 +186,39 @@ Examples:
 				fmt.Fprintf(os.Stderr, "Error: no database path found\n")
 				os.Exit(1)
 			}
-			store, err = sqlite.NewWithTimeout(rootCtx, dbPath, lockTimeout)
+			beadsDir := filepath.Dir(dbPath)
+			store, err = factory.NewFromConfigWithOptions(rootCtx, beadsDir, factory.Options{
+				LockTimeout: lockTimeout,
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
 				os.Exit(1)
 			}
 			defer func() { _ = store.Close() }()
+		}
+
+		// Handle --events and --events-reset flags
+		if eventsFlag || eventsReset {
+			eventsPath := filepath.Join(filepath.Dir(dbPath), "events.jsonl")
+			ctx := rootCtx
+
+			if eventsReset {
+				if err := resetEventsExport(ctx, store, eventsPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error resetting events export: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "Events export state reset\n")
+			}
+
+			if eventsFlag {
+				if err := exportEventsToJSONL(ctx, store, eventsPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Error exporting events: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "Events exported to %s\n", eventsPath)
+			}
+
+			return
 		}
 
 		// Normalize labels: trim, dedupe, remove empty
@@ -220,6 +252,15 @@ Examples:
 		}
 		if len(labelsAny) > 0 {
 			filter.LabelsAny = labelsAny
+		}
+		if idFilter != "" {
+			ids := util.NormalizeLabels(strings.Split(idFilter, ","))
+			if len(ids) > 0 {
+				filter.IDs = ids
+			}
+		}
+		if parentID != "" {
+			filter.ParentID = &parentID
 		}
 
 		// Priority exact match (use Changed() to properly handle P0)
@@ -293,8 +334,27 @@ Examples:
 			os.Exit(1)
 		}
 
+		// Detect if any substantive filters are active (partial export)
+		// Safety checks should be skipped for filtered exports since the user
+		// intentionally wants a subset of issues, not the full database
+		isFilteredExport := filter.Status != nil ||
+			filter.Assignee != nil ||
+			filter.IssueType != nil ||
+			len(filter.Labels) > 0 ||
+			len(filter.LabelsAny) > 0 ||
+			len(filter.IDs) > 0 ||
+			filter.ParentID != nil ||
+			filter.Priority != nil ||
+			filter.PriorityMin != nil ||
+			filter.PriorityMax != nil ||
+			filter.CreatedAfter != nil ||
+			filter.CreatedBefore != nil ||
+			filter.UpdatedAfter != nil ||
+			filter.UpdatedBefore != nil
+
 		// Safety check: prevent exporting empty database over non-empty JSONL
-		if len(issues) == 0 && output != "" && !force {
+		// Skip this check for filtered exports - the user intentionally wants a subset
+		if len(issues) == 0 && output != "" && !force && !isFilteredExport {
 			existingCount, err := countIssuesInJSONL(output)
 			if err != nil {
 				// If we can't read the file, it might not exist yet, which is fine
@@ -313,7 +373,8 @@ Examples:
 		}
 
 		// Safety check: prevent exporting stale database that would lose issues
-		if output != "" && !force {
+		// Skip this check for filtered exports - the user intentionally wants a subset
+		if output != "" && !force && !isFilteredExport {
 			debug.Logf("Debug: checking staleness - output=%s, force=%v\n", output, force)
 
 			// Read existing JSONL to get issue IDs
@@ -396,14 +457,26 @@ Examples:
 			issue.Dependencies = allDeps[issue.ID]
 		}
 
-		// Populate labels for all issues
+		// Populate labels and comments for all issues (batch APIs)
+		ids := make([]string, 0, len(issues))
 		for _, issue := range issues {
-			labels, err := store.GetLabels(ctx, issue.ID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting labels for %s: %v\n", issue.ID, err)
-				os.Exit(1)
-			}
-			issue.Labels = labels
+			ids = append(ids, issue.ID)
+		}
+
+		labelsMap, err := store.GetLabelsForIssues(ctx, ids)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting labels: %v\n", err)
+			os.Exit(1)
+		}
+		commentsMap, err := store.GetCommentsForIssues(ctx, ids)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting comments: %v\n", err)
+			os.Exit(1)
+		}
+
+		for _, issue := range issues {
+			issue.Labels = labelsMap[issue.ID]
+			issue.Comments = commentsMap[issue.ID]
 		}
 
 		// Open output
@@ -547,11 +620,15 @@ Examples:
 			// Only do this when exporting to default JSONL path (not arbitrary outputs)
 			// This prevents validatePreExport from incorrectly blocking on next export
 			if output == "" || output == findJSONLPath() {
-				beadsDir := filepath.Dir(finalPath)
-				dbPath := filepath.Join(beadsDir, "beads.db")
-				if err := TouchDatabaseFile(dbPath, finalPath); err != nil {
-					// Log warning but don't fail export
-					fmt.Fprintf(os.Stderr, "Warning: failed to update database mtime: %v\n", err)
+				// Dolt backend does not have a SQLite DB file, so only touch mtime for SQLite.
+				// Use store.Path() to get the actual database location, not the JSONL directory,
+				// since sync-branch exports write JSONL to a worktree but the DB stays in the main repo.
+				if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
+					dbPath := sqliteStore.Path()
+					if err := TouchDatabaseFile(dbPath, finalPath); err != nil {
+						// Log warning but don't fail export
+						fmt.Fprintf(os.Stderr, "Warning: failed to update database mtime: %v\n", err)
+					}
 				}
 			}
 		}
@@ -579,6 +656,8 @@ func init() {
 	exportCmd.Flags().StringP("status", "s", "", "Filter by status")
 	exportCmd.Flags().Bool("force", false, "Force export even if database is empty")
 	exportCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output export statistics in JSON format")
+	exportCmd.Flags().Bool("events", false, "Export events to .beads/events.jsonl (append-only)")
+	exportCmd.Flags().Bool("events-reset", false, "Reset events export state and truncate events.jsonl")
 
 	// Filter flags
 	registerPriorityFlag(exportCmd, "")
@@ -596,6 +675,12 @@ func init() {
 	exportCmd.Flags().String("created-before", "", "Filter issues created before date (YYYY-MM-DD or RFC3339)")
 	exportCmd.Flags().String("updated-after", "", "Filter issues updated after date (YYYY-MM-DD or RFC3339)")
 	exportCmd.Flags().String("updated-before", "", "Filter issues updated before date (YYYY-MM-DD or RFC3339)")
+
+	// ID filter
+	exportCmd.Flags().String("id", "", "Filter by specific issue IDs (comma-separated, e.g., bd-1,bd-5,bd-10)")
+
+	// Parent filter
+	exportCmd.Flags().String("parent", "", "Filter by parent issue ID (shows children of specified issue)")
 
 	rootCmd.AddCommand(exportCmd)
 }

@@ -17,6 +17,54 @@ import (
 	"github.com/steveyegge/beads/internal/utils"
 )
 
+// EnsureWorktree ensures the sync branch worktree exists if sync-branch is configured.
+// This should be called early during initialization (e.g., from ensureStoreActive) to
+// guarantee the worktree exists before any JSONL operations.
+//
+// Returns the worktree path if sync-branch is configured and worktree was created/exists,
+// or empty string if sync-branch is not configured.
+//
+// This function is idempotent - safe to call multiple times. The underlying
+// CreateBeadsWorktree is also idempotent and returns early if the worktree is healthy.
+//
+// GH#1349: Fixes fresh clone scenario where findJSONLPath would fall back to main's
+// stale JSONL because the worktree didn't exist yet.
+func EnsureWorktree(ctx context.Context) (string, error) {
+	syncBranch := GetFromYAML()
+	if syncBranch == "" {
+		return "", nil // Not configured, nothing to do
+	}
+
+	// Get repo root - need beads package for this
+	// Use git directly to avoid import cycle with beads package
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", nil // Not in a git repo, nothing to do
+	}
+	repoRoot := strings.TrimSpace(string(output))
+
+	worktreePath := getBeadsWorktreePath(ctx, repoRoot, syncBranch)
+
+	// Check if worktree already exists and is healthy
+	if _, err := os.Stat(worktreePath); err == nil {
+		// Worktree directory exists - let CreateBeadsWorktree verify health
+		wtMgr := git.NewWorktreeManager(repoRoot)
+		if err := wtMgr.CreateBeadsWorktree(syncBranch, worktreePath); err != nil {
+			return "", fmt.Errorf("failed to verify/repair sync worktree: %w", err)
+		}
+		return worktreePath, nil
+	}
+
+	// Create worktree
+	wtMgr := git.NewWorktreeManager(repoRoot)
+	if err := wtMgr.CreateBeadsWorktree(syncBranch, worktreePath); err != nil {
+		return "", fmt.Errorf("failed to create sync worktree: %w", err)
+	}
+
+	return worktreePath, nil
+}
+
 // CommitResult contains information about a worktree commit operation
 type CommitResult struct {
 	Committed  bool   // True if changes were committed
@@ -126,7 +174,12 @@ func CommitToSyncBranch(ctx context.Context, repoRoot, syncBranch, jsonlPath str
 	}
 
 	// Check for changes in worktree
-	worktreeJSONLPath := filepath.Join(worktreePath, jsonlRelPath)
+	// GH#810, GH#1103: Normalize path for worktree JSONL path handling
+	// When sync-branch is configured, findJSONLPath() returns the worktree path,
+	// making jsonlRelPath include extra path components (e.g., ".git/beads-worktrees/beads-sync/.beads/issues.jsonl").
+	// NormalizeBeadsRelPath strips these to get the correct relative path (".beads/issues.jsonl").
+	normalizedRelPath := git.NormalizeBeadsRelPath(jsonlRelPath)
+	worktreeJSONLPath := filepath.Join(worktreePath, normalizedRelPath)
 	hasChanges, err := hasChangesInWorktree(ctx, worktreePath, worktreeJSONLPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check for changes in worktree: %w", err)
@@ -138,7 +191,7 @@ func CommitToSyncBranch(ctx context.Context, repoRoot, syncBranch, jsonlPath str
 
 	// Commit in worktree
 	result.Message = fmt.Sprintf("bd sync: %s", time.Now().Format("2006-01-02 15:04:05"))
-	if err := commitInWorktree(ctx, worktreePath, jsonlRelPath, result.Message); err != nil {
+	if err := commitInWorktree(ctx, worktreePath, normalizedRelPath, result.Message); err != nil {
 		return nil, fmt.Errorf("failed to commit in worktree: %w", err)
 	}
 	result.Committed = true
@@ -272,8 +325,12 @@ func PullFromSyncBranch(ctx context.Context, repoRoot, syncBranch, jsonlPath str
 	// Case 1: Already up to date (remote has nothing new)
 	if remoteAhead == 0 {
 		result.Pulled = true
-		// Still copy JSONL in case worktree has uncommitted changes
-		if err := copyJSONLToMainRepo(worktreePath, jsonlRelPath, jsonlPath); err != nil {
+		// GH#1173: Do NOT copy uncommitted worktree changes to main repo.
+		// The worktree may have uncommitted changes from previous exports that
+		// haven't been committed yet. Copying those to main would make local
+		// data appear as "remote" data, corrupting the 3-way merge.
+		// Instead, copy only the COMMITTED state from the worktree.
+		if err := copyCommittedJSONLToMainRepo(ctx, worktreePath, jsonlRelPath, jsonlPath); err != nil {
 			return nil, err
 		}
 		return result, nil
@@ -655,6 +712,35 @@ func extractJSONLFromCommit(ctx context.Context, worktreePath, commit, filePath 
 	return output, nil
 }
 
+// copyCommittedJSONLToMainRepo copies the COMMITTED JSONL from worktree to main repo.
+// GH#1173: This extracts the file from HEAD rather than the working directory,
+// ensuring uncommitted local changes don't corrupt the 3-way merge.
+func copyCommittedJSONLToMainRepo(ctx context.Context, worktreePath, jsonlRelPath, jsonlPath string) error {
+	// GH#785: Handle bare repo worktrees
+	normalizedRelPath := normalizeBeadsRelPath(jsonlRelPath)
+
+	// Extract the committed JSONL from HEAD
+	data, err := extractJSONLFromCommit(ctx, worktreePath, "HEAD", normalizedRelPath)
+	if err != nil {
+		// File might not exist in HEAD yet (first sync), nothing to copy
+		return nil
+	}
+
+	if err := os.WriteFile(jsonlPath, data, 0600); err != nil {
+		return fmt.Errorf("failed to write main JSONL: %w", err)
+	}
+
+	// Also copy committed metadata.json if it exists
+	beadsDir := filepath.Dir(jsonlPath)
+	metadataRelPath := filepath.Join(filepath.Dir(normalizedRelPath), "metadata.json")
+	if metaData, err := extractJSONLFromCommit(ctx, worktreePath, "HEAD", metadataRelPath); err == nil {
+		dstPath := filepath.Join(beadsDir, "metadata.json")
+		_ = os.WriteFile(dstPath, metaData, 0600) // Best effort
+	}
+
+	return nil
+}
+
 // copyJSONLToMainRepo copies JSONL and related files from worktree to main repo.
 func copyJSONLToMainRepo(worktreePath, jsonlRelPath, jsonlPath string) error {
 	// GH#785: Handle bare repo worktrees where jsonlRelPath might include the
@@ -728,7 +814,8 @@ func commitInWorktree(ctx context.Context, worktreePath, jsonlRelPath, message s
 
 	// Use -f (force) to add files even if they're gitignored
 	// In contributor mode, .beads/ is excluded in .git/info/exclude but needs to be tracked in sync branch
-	addCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "add", "-f", beadsRelDir)
+	// Use --sparse to work correctly with sparse-checkout enabled worktrees (fixes #1076)
+	addCmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "add", "-f", "--sparse", beadsRelDir)
 	if err := addCmd.Run(); err != nil {
 		return fmt.Errorf("git add failed in worktree: %w", err)
 	}
@@ -972,6 +1059,10 @@ func getRemoteForBranch(ctx context.Context, worktreePath, branch string) string
 // GetRepoRoot returns the git repository root directory
 // For worktrees, this returns the main repository root (not the worktree root)
 // The returned path is canonicalized to fix case on case-insensitive filesystems (GH#880)
+//
+// Deprecated: Use beads.GetRepoContext().RepoRoot instead. GetRepoContext provides
+// a unified API that correctly handles BEADS_DIR, worktrees, and redirects.
+// This function will be removed in a future release.
 func GetRepoRoot(ctx context.Context) (string, error) {
 	var repoRoot string
 

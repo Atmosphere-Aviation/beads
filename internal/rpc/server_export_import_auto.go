@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/autoimport"
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/export"
 	"github.com/steveyegge/beads/internal/importer"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -32,7 +32,8 @@ func (s *Server) handleExport(req *Request) Response {
 	}
 
 	store := s.storage
-	ctx := s.reqCtx(req)
+	ctx, cancel := s.reqCtx(req)
+	defer cancel()
 
 	// Load export configuration (user-initiated export, not auto)
 	cfg, err := export.LoadConfig(ctx, store, false)
@@ -205,6 +206,17 @@ func (s *Server) handleExport(req *Request) Response {
 		fmt.Fprintf(os.Stderr, "Warning: failed to clear dirty flags: %v\n", err)
 	}
 
+	// Update export_hashes for all exported issues (GH#1278)
+	// This ensures child issues created with --parent are properly registered
+	for _, issue := range issues {
+		if issue.ContentHash != "" {
+			if err := store.SetExportHash(ctx, issue.ID, issue.ContentHash); err != nil {
+				// Non-fatal, just log
+				fmt.Fprintf(os.Stderr, "Warning: failed to set export hash for %s: %v\n", issue.ID, err)
+			}
+		}
+	}
+
 	// Write manifest if configured
 	if manifest != nil {
 		manifest.ExportedCount = len(exportedIDs)
@@ -230,40 +242,28 @@ func (s *Server) handleExport(req *Request) Response {
 	}
 }
 
-// handleImport handles the import operation
-func (s *Server) handleImport(req *Request) Response {
-	var importArgs ImportArgs
-	if err := json.Unmarshal(req.Args, &importArgs); err != nil {
-		return Response{
-			Success: false,
-			Error:   fmt.Sprintf("invalid import args: %v", err),
-		}
-	}
-
-	// Note: The actual import logic is complex and lives in cmd/bd/import.go
-	// For now, we'll return an error suggesting to use direct mode
-	// In the future, we can refactor the import logic into a shared package
-	return Response{
-		Success: false,
-		Error:   "import via daemon not yet implemented, use --no-daemon flag",
-	}
-}
-
 // checkAndAutoImportIfStale checks if JSONL is newer than last import and triggers auto-import
 // This fixes bd-132: daemon shows stale data after git pull
 // This fixes bd-8931: daemon gets stuck when auto-import blocked by git conflicts
 func (s *Server) checkAndAutoImportIfStale(req *Request) error {
+	if !config.NeedsJSONLImport() {
+		return nil
+	}
+
 	// Get storage for this request
 	store := s.storage
 
-	ctx := s.reqCtx(req)
+	ctx, cancel := s.reqCtx(req)
+	defer cancel()
 
-	// Get database path from storage
-	sqliteStore, ok := store.(*sqlite.SQLiteStorage)
-	if !ok {
-		return fmt.Errorf("storage is not SQLiteStorage")
+	// Skip auto-import in dolt-native mode — JSONL is export-only backup
+	mode, _ := store.GetConfig(ctx, "sync.mode")
+	if mode == "dolt-native" {
+		return nil
 	}
-	dbPath := sqliteStore.Path()
+
+	// Get database path from storage (Path() is part of Storage interface)
+	dbPath := store.Path()
 
 	// Fast path: Check if JSONL is stale using cheap mtime check
 	// This avoids reading/hashing JSONL on every request
@@ -447,12 +447,6 @@ func (s *Server) triggerExport(ctx context.Context, store storage.Storage, dbPat
 	dbDir := filepath.Dir(dbPath)
 	jsonlPath := utils.FindJSONLInDir(dbDir)
 
-	// Get all issues from storage
-	sqliteStore, ok := store.(*sqlite.SQLiteStorage)
-	if !ok {
-		return fmt.Errorf("storage is not SQLiteStorage")
-	}
-
 	// Load export configuration (auto-export mode)
 	cfg, err := export.LoadConfig(ctx, store, true)
 	if err != nil {
@@ -466,7 +460,8 @@ func (s *Server) triggerExport(ctx context.Context, store storage.Storage, dbPat
 	}
 
 	// Export to JSONL including tombstones for sync propagation (bd-rp4o fix)
-	allIssues, err := sqliteStore.SearchIssues(ctx, "", types.IssueFilter{IncludeTombstones: true})
+	// SearchIssues is part of the Storage interface
+	allIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{IncludeTombstones: true})
 	if err != nil {
 		return fmt.Errorf("failed to fetch issues for export: %w", err)
 	}

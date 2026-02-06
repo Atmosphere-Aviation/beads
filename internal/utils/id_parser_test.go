@@ -316,6 +316,21 @@ func TestResolvePartialID_NoConfig(t *testing.T) {
 	}
 }
 
+func TestResolvePartialID_NilStorage(t *testing.T) {
+	ctx := context.Background()
+
+	// Test that nil storage returns an error instead of panicking
+	_, err := ResolvePartialID(ctx, nil, "bd-123")
+	if err == nil {
+		t.Fatal("ResolvePartialID with nil storage should return error, got nil")
+	}
+
+	expectedMsg := "storage is nil"
+	if !contains(err.Error(), expectedMsg) {
+		t.Errorf("ResolvePartialID error = %q; want error containing %q", err.Error(), expectedMsg)
+	}
+}
+
 func TestExtractIssuePrefix(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -417,6 +432,37 @@ func TestExtractIssuePrefix(t *testing.T) {
 			issueID:  "test-proj-abc",
 			expected: "test-proj", // 3-char all-letter now accepted as hash (GH #446)
 		},
+		// GH#405: multi-hyphen prefixes with hash suffixes
+		{
+			name:     "hacker-news prefix with hash (GH#405)",
+			issueID:  "hacker-news-ko4",
+			expected: "hacker-news", // Not "hacker" - 3-char hash uses last hyphen
+		},
+		{
+			name:     "hacker-news prefix with numeric suffix (GH#405)",
+			issueID:  "hacker-news-42",
+			expected: "hacker-news", // Numeric suffix uses last hyphen
+		},
+		{
+			name:     "me-py-toolkit prefix with hash (GH#405)",
+			issueID:  "me-py-toolkit-a1b",
+			expected: "me-py-toolkit", // 3-part prefix, 3-char hash
+		},
+		{
+			name:     "me-py-toolkit prefix with 4-char hash (GH#405)",
+			issueID:  "me-py-toolkit-1a2b",
+			expected: "me-py-toolkit", // 3-part prefix, 4-char hash with digits
+		},
+		{
+			name:     "me-py-toolkit prefix with numeric suffix (GH#405)",
+			issueID:  "me-py-toolkit-7",
+			expected: "me-py-toolkit", // 3-part prefix, numeric suffix
+		},
+		{
+			name:     "three-hyphen prefix with 3-char all-letter hash",
+			issueID:  "my-cool-web-app-bat",
+			expected: "my-cool-web-app", // 4-part prefix, 3-char all-letter hash
+		},
 	}
 
 	for _, tt := range tests {
@@ -493,8 +539,8 @@ func TestExtractIssueNumber(t *testing.T) {
 }
 
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) && 
-		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr || 
+	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
+		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
 		findSubstring(s, substr)))
 }
 
@@ -505,4 +551,137 @@ func findSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestResolvePartialID_CrossPrefix tests resolution of IDs with different prefixes
+// than the configured prefix. This is the GH#1513 fix for multi-repo scenarios
+// where issues from different rigs (with different prefixes) are hydrated into
+// a single database.
+func TestResolvePartialID_CrossPrefix(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New("")
+
+	// Create issues with different prefixes (simulating multi-repo hydration)
+	hqIssue := &types.Issue{
+		ID:        "hq-abc12",
+		Title:     "HQ Issue",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	aapIssue := &types.Issue{
+		ID:        "aap-4ar",
+		Title:     "AAP Issue from different rig",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	crIssue := &types.Issue{
+		ID:        "cr-xyz99",
+		Title:     "CR Issue from another rig",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+
+	if err := store.CreateIssue(ctx, hqIssue, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateIssue(ctx, aapIssue, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateIssue(ctx, crIssue, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set config prefix to "hq" (the "town" prefix)
+	if err := store.SetConfig(ctx, "issue_prefix", "hq"); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		input       string
+		expected    string
+		shouldError bool
+	}{
+		{
+			name:     "configured prefix - full ID",
+			input:    "hq-abc12",
+			expected: "hq-abc12",
+		},
+		{
+			name:     "configured prefix - short ID",
+			input:    "abc12",
+			expected: "hq-abc12",
+		},
+		{
+			name:     "different prefix - full ID (GH#1513)",
+			input:    "aap-4ar",
+			expected: "aap-4ar",
+		},
+		{
+			name:     "different prefix - another rig (GH#1513)",
+			input:    "cr-xyz99",
+			expected: "cr-xyz99",
+		},
+		{
+			name:     "different prefix - short ID falls back to substring match",
+			input:    "4ar",
+			expected: "aap-4ar",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ResolvePartialID(ctx, store, tt.input)
+
+			if tt.shouldError {
+				if err == nil {
+					t.Errorf("ResolvePartialID(%q) expected error, got nil", tt.input)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("ResolvePartialID(%q) unexpected error: %v", tt.input, err)
+				}
+				if result != tt.expected {
+					t.Errorf("ResolvePartialID(%q) = %q; want %q", tt.input, result, tt.expected)
+				}
+			}
+		})
+	}
+}
+
+// TestLooksLikePrefixedID tests the helper function for detecting prefixed IDs
+func TestLooksLikePrefixedID(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"aap-4ar", true},
+		{"bd-abc123", true},
+		{"hq-xyz", true},
+		{"cr-99", true},
+		{"myproj-task1", true},
+		{"a-b", true},       // minimal valid prefix
+		{"abc12345-x", true}, // 8-char prefix (max)
+
+		// Invalid cases
+		{"abc", false},           // no hyphen
+		{"", false},              // empty
+		{"-abc", false},          // hyphen at start
+		{"ABC-123", false},       // uppercase
+		{"abcdefghi-x", false},   // prefix too long (9 chars)
+		{"abc-", false},          // empty suffix
+		{"abc--def", false},      // suffix starts with hyphen
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := looksLikePrefixedID(tt.input)
+			if result != tt.expected {
+				t.Errorf("looksLikePrefixedID(%q) = %v; want %v", tt.input, result, tt.expected)
+			}
+		})
+	}
 }

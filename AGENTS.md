@@ -1,10 +1,10 @@
 # Agent Instructions
 
-See [CLAUDE.md](CLAUDE.md) for full instructions.
+See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full instructions.
 
 This file exists for compatibility with tools that look for AGENTS.md.
 
-## Key Sections in CLAUDE.md
+## Key Sections
 
 - **Issue Tracking** - How to use bd for work management
 - **Development Guidelines** - Code standards and testing
@@ -18,7 +18,44 @@ This file exists for compatibility with tools that look for AGENTS.md.
 - Status: `○ ◐ ● ✓ ❄`
 - Priority: `● P0` (filled circle with color)
 
-See CLAUDE.md "Visual Design System" section for full guidance.
+See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full development guidelines.
+
+## Agent Warning: Interactive Commands
+
+**DO NOT use `bd edit`** - it opens an interactive editor ($EDITOR) which AI agents cannot use.
+
+Use `bd update` with flags instead:
+```bash
+bd update <id> --description "new description"
+bd update <id> --title "new title"
+bd update <id> --design "design notes"
+bd update <id> --notes "additional notes"
+bd update <id> --acceptance "acceptance criteria"
+```
+
+## Non-Interactive Shell Commands
+
+**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+
+Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+
+**Use these forms instead:**
+```bash
+# Force overwrite without prompting
+cp -f source dest           # NOT: cp source dest
+mv -f source dest           # NOT: mv source dest
+rm -f file                  # NOT: rm file
+
+# For recursive operations
+rm -rf directory            # NOT: rm -r directory
+cp -rf source dest          # NOT: cp -r source dest
+```
+
+**Other commands that may prompt:**
+- `scp` - use `-o BatchMode=yes` for non-interactive
+- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
+- `apt-get` - use `-y` flag
+- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
 ## Landing the Plane (Session Completion)
 
@@ -32,7 +69,6 @@ See CLAUDE.md "Visual Design System" section for full guidance.
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd sync
    git push
    git status  # MUST show "up to date with origin"
    ```

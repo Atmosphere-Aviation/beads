@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -292,26 +293,26 @@ func stopDaemon(pidFile string) {
 		fmt.Println("Daemon stopped")
 		return
 	}
-	
+
 	socketPath := getSocketPathForPID(pidFile)
-	
+
 	if err := process.Kill(); err != nil {
 		// Ignore "process already finished" errors
 		if !strings.Contains(err.Error(), "process already finished") {
 			fmt.Fprintf(os.Stderr, "Error killing process: %v\n", err)
 		}
 	}
-	
+
 	// Clean up stale artifacts after forced kill
 	_ = os.Remove(pidFile) // Best-effort cleanup, file may not exist
-	
+
 	// Also remove socket file if it exists
 	if _, err := os.Stat(socketPath); err == nil {
 		if err := os.Remove(socketPath); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to remove stale socket: %v\n", err)
 		}
 	}
-	
+
 	fmt.Println("Daemon killed")
 }
 
@@ -369,16 +370,24 @@ func stopAllDaemons() {
 }
 
 // startDaemon starts the daemon (in foreground if requested, otherwise background)
-func startDaemon(interval time.Duration, autoCommit, autoPush, autoPull, localMode, foreground bool, logFile, pidFile, logLevel string, logJSON bool) {
+func startDaemon(interval time.Duration, autoCommit, autoPush, autoPull, localMode, foreground bool, logFile, pidFile, logLevel string, logJSON, federation bool, federationPort, remotesapiPort int) {
 	logPath, err := getLogFilePath(logFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
+	// Guardrail: single-process backends must never spawn a daemon process.
+	// Exception: federation mode enables multi-writer support.
+	// This should already be blocked by command guards, but keep it defensive.
+	if singleProcessOnlyBackend() && !federation {
+		fmt.Fprintf(os.Stderr, "Error: daemon mode is not supported for single-process backends (e.g., dolt). Hint: use sqlite backend for daemon mode, use --federation for dolt server mode, or run commands in direct mode\n")
+		os.Exit(1)
+	}
+
 	// Run in foreground if --foreground flag set or if we're the forked child process
 	if foreground || os.Getenv("BD_DAEMON_FOREGROUND") == "1" {
-		runDaemonLoop(interval, autoCommit, autoPush, autoPull, localMode, logPath, pidFile, logLevel, logJSON)
+		runDaemonLoop(interval, autoCommit, autoPush, autoPull, localMode, logPath, pidFile, logLevel, logJSON, federation, federationPort, remotesapiPort)
 		return
 	}
 
@@ -411,6 +420,15 @@ func startDaemon(interval time.Duration, autoCommit, autoPush, autoPull, localMo
 	}
 	if logJSON {
 		args = append(args, "--log-json")
+	}
+	if federation {
+		args = append(args, "--federation")
+		if federationPort != 0 && federationPort != 3306 {
+			args = append(args, "--federation-port", strconv.Itoa(federationPort))
+		}
+		if remotesapiPort != 0 && remotesapiPort != 8080 {
+			args = append(args, "--remotesapi-port", strconv.Itoa(remotesapiPort))
+		}
 	}
 
 	cmd := exec.Command(exe, args...) // #nosec G204 - bd daemon command from trusted binary
@@ -455,9 +473,9 @@ func startDaemon(interval time.Duration, autoCommit, autoPush, autoPull, localMo
 }
 
 // setupDaemonLock acquires the daemon lock and writes PID file
-func setupDaemonLock(pidFile string, dbPath string, log daemonLogger) (*DaemonLock, error) {
+func setupDaemonLock(pidFile string, dbPath string, log *slog.Logger) (*DaemonLock, error) {
 	beadsDir := filepath.Dir(pidFile)
-	
+
 	// Detect nested .beads directories (e.g., .beads/.beads/.beads/)
 	cleanPath := filepath.Clean(beadsDir)
 	if strings.Contains(cleanPath, string(filepath.Separator)+".beads"+string(filepath.Separator)+".beads") {
@@ -466,7 +484,7 @@ func setupDaemonLock(pidFile string, dbPath string, log daemonLogger) (*DaemonLo
 		log.Info("hint: use absolute paths for BEADS_DB or run from workspace root")
 		return nil, fmt.Errorf("nested .beads directory detected")
 	}
-	
+
 	lock, err := acquireDaemonLock(beadsDir, dbPath)
 	if err != nil {
 		if err == ErrDaemonLocked {

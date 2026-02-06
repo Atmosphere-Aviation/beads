@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,12 +17,52 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/syncbranch"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// warnIfSyncBranchMisconfigured logs a warning at daemon startup if sync-branch
+// equals the current branch. This is a one-time warning to alert users about
+// the misconfiguration. The daemon continues to start (warn only, don't block).
+// Returns true if misconfigured (warning was logged), false otherwise.
+// GH#1258: Prevents silent failure when sync-branch == current-branch.
+func warnIfSyncBranchMisconfigured(ctx context.Context, store storage.Storage, log *slog.Logger) bool {
+	syncBranch, err := syncbranch.Get(ctx, store)
+	if err != nil || syncBranch == "" {
+		return false // No sync branch configured, not misconfigured
+	}
+
+	if syncbranch.IsSyncBranchSameAsCurrent(ctx, syncBranch) {
+		log.Warn("sync-branch misconfiguration detected",
+			"sync_branch", syncBranch,
+			"message", "sync-branch is your current branch; daemon sync operations will be skipped; configure a dedicated sync branch (e.g., 'beads-sync') to enable sync")
+		return true
+	}
+
+	return false
+}
+
+// shouldSkipDueToSameBranch checks if operation should be skipped because
+// sync-branch == current-branch. Returns true if should skip, logs reason.
+// Uses fail-open pattern: if branch detection fails, allows operation to proceed.
+func shouldSkipDueToSameBranch(ctx context.Context, store storage.Storage, operation string, log *slog.Logger) bool {
+	syncBranch, err := syncbranch.Get(ctx, store)
+	if err != nil || syncBranch == "" {
+		return false // No sync branch configured, allow
+	}
+
+	if syncbranch.IsSyncBranchSameAsCurrent(ctx, syncBranch) {
+		log.Info("Skipping operation: sync-branch is current branch", "operation", operation, "sync_branch", syncBranch)
+		return true
+	}
+
+	return false
+}
 
 // exportToJSONLWithStore exports issues to JSONL using the provided store.
 // If multi-repo mode is configured, routes issues to their respective JSONL files.
 // Otherwise, exports to a single JSONL file.
+// Always writes local JSONL as a safety net (even in dolt-native mode).
 func exportToJSONLWithStore(ctx context.Context, store storage.Storage, jsonlPath string) error {
 	// Try multi-repo export first
 	sqliteStore, ok := store.(*sqlite.SQLiteStorage)
@@ -138,6 +179,17 @@ func exportToJSONLWithStore(ctx context.Context, store storage.Storage, jsonlPat
 		return writeErr
 	}
 
+	// Update export_hashes for all exported issues (GH#1278)
+	// This ensures child issues created with --parent are properly registered
+	for _, issue := range issues {
+		if issue.ContentHash != "" {
+			if err := store.SetExportHash(ctx, issue.ID, issue.ContentHash); err != nil {
+				// Non-fatal warning - continue with other issues
+				fmt.Fprintf(os.Stderr, "Warning: failed to set export hash for %s: %v\n", issue.ID, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -186,6 +238,30 @@ func importToJSONLWithStore(ctx context.Context, store storage.Storage, jsonlPat
 			continue
 		}
 		issue.SetDefaults() // Apply defaults for omitted fields
+
+		// Migrate old JSONL format: auto-correct deleted status to tombstone
+		// This handles JSONL files from versions that used "deleted" instead of "tombstone"
+		// (GH#1223: Stuck in sync diversion loop)
+		if issue.Status == types.Status("deleted") && issue.DeletedAt != nil {
+			issue.Status = types.StatusTombstone
+		}
+
+		// Fix: Any non-tombstone issue with deleted_at set is malformed and should be tombstone
+		// This catches issues that may have been corrupted or migrated incorrectly
+		if issue.Status != types.StatusTombstone && issue.DeletedAt != nil {
+			issue.Status = types.StatusTombstone
+		}
+
+		if issue.Status == types.StatusClosed && issue.ClosedAt == nil {
+			now := time.Now()
+			issue.ClosedAt = &now
+		}
+
+		// Ensure tombstones have deleted_at set (fix for malformed data)
+		if issue.Status == types.StatusTombstone && issue.DeletedAt == nil {
+			now := time.Now()
+			issue.DeletedAt = &now
+		}
 
 		issues = append(issues, &issue)
 	}
@@ -267,11 +343,12 @@ func sanitizeMetadataKey(key string) string {
 // This function does NOT provide atomicity between JSONL write, metadata updates, and DB mtime.
 // If a crash occurs between these operations, metadata may be inconsistent. However, this is
 // acceptable because:
-//   1. The worst case is "JSONL content has changed" error on next export
-//   2. User can fix by running 'bd import' (safe, no data loss)
-//   3. Current approach is simple and doesn't require complex WAL or format changes
+//  1. The worst case is "JSONL content has changed" error on next export
+//  2. User can fix by running 'bd import' (safe, no data loss)
+//  3. Current approach is simple and doesn't require complex WAL or format changes
+//
 // Future: Consider defensive checks on startup if this becomes a common issue.
-func updateExportMetadata(ctx context.Context, store storage.Storage, jsonlPath string, log daemonLogger, keySuffix string) {
+func updateExportMetadata(ctx context.Context, store storage.Storage, jsonlPath string, log *slog.Logger, keySuffix string) {
 	// Sanitize keySuffix to handle Windows paths with colons
 	if keySuffix != "" {
 		keySuffix = sanitizeMetadataKey(keySuffix)
@@ -279,7 +356,7 @@ func updateExportMetadata(ctx context.Context, store storage.Storage, jsonlPath 
 
 	currentHash, err := computeJSONLHash(jsonlPath)
 	if err != nil {
-		log.log("Warning: failed to compute JSONL hash for metadata update: %v", err)
+		log.Info("Warning: failed to compute JSONL hash for metadata update", "error", err)
 		return
 	}
 
@@ -298,20 +375,20 @@ func updateExportMetadata(ctx context.Context, store storage.Storage, jsonlPath 
 	// Alternative: Make this critical and fail the export if metadata updates fail,
 	// but this makes exports more fragile and doesn't prevent data corruption.
 	if err := store.SetMetadata(ctx, hashKey, currentHash); err != nil {
-		log.log("Warning: failed to update %s: %v", hashKey, err)
-		log.log("Next export may require running 'bd import' first")
+		log.Info("Warning: failed to update metadata", "key", hashKey, "error", err)
+		log.Info("Next export may require running 'bd import' first")
 	}
 
 	// Use RFC3339Nano for nanosecond precision to avoid race with file mtime (fixes #399)
 	exportTime := time.Now().Format(time.RFC3339Nano)
 	if err := store.SetMetadata(ctx, timeKey, exportTime); err != nil {
-		log.log("Warning: failed to update %s: %v", timeKey, err)
+		log.Info("Warning: failed to update metadata", "key", timeKey, "error", err)
 	}
 	// Note: mtime tracking removed (git doesn't preserve mtime)
 }
 
 // validateDatabaseFingerprint checks that the database belongs to this repository
-func validateDatabaseFingerprint(ctx context.Context, store storage.Storage, log *daemonLogger) error {
+func validateDatabaseFingerprint(ctx context.Context, store storage.Storage, log *slog.Logger) error {
 
 	// Get stored repo ID
 	storedRepoID, err := store.GetMetadata(ctx, "repo_id")
@@ -343,7 +420,7 @@ silent corruption when databases are copied between repositories.
 	// Validate repo ID matches current repository
 	currentRepoID, err := beads.ComputeRepoID()
 	if err != nil {
-		log.log("Warning: could not compute current repository ID: %v", err)
+		log.Info("Warning: could not compute current repository ID", "error", err)
 		return nil
 	}
 
@@ -374,25 +451,25 @@ Solutions:
 `, storedRepoID[:8], currentRepoID[:8])
 	}
 
-	log.log("Repository fingerprint validated: %s", currentRepoID[:8])
+	log.Info("Repository fingerprint validated", "repo_id", currentRepoID[:8])
 	return nil
 }
 
 // createExportFunc creates a function that only exports database to JSONL
 // and optionally commits/pushes (no git pull or import). Used for mutation events.
-func createExportFunc(ctx context.Context, store storage.Storage, autoCommit, autoPush bool, log daemonLogger) func() {
+func createExportFunc(ctx context.Context, store storage.Storage, autoCommit, autoPush bool, log *slog.Logger) func() {
 	return performExport(ctx, store, autoCommit, autoPush, false, log)
 }
 
 // createLocalExportFunc creates a function that only exports database to JSONL
 // without any git operations. Used for local-only mode with mutation events.
-func createLocalExportFunc(ctx context.Context, store storage.Storage, log daemonLogger) func() {
+func createLocalExportFunc(ctx context.Context, store storage.Storage, log *slog.Logger) func() {
 	return performExport(ctx, store, false, false, true, log)
 }
 
 // performExport is the shared implementation for export-only functions.
 // skipGit: if true, skips all git operations (commits, pushes).
-func performExport(ctx context.Context, store storage.Storage, autoCommit, autoPush, skipGit bool, log daemonLogger) func() {
+func performExport(ctx context.Context, store storage.Storage, autoCommit, autoPush, skipGit bool, log *slog.Logger) func() {
 	return func() {
 		exportCtx, exportCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer exportCancel()
@@ -401,11 +478,18 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 		if skipGit {
 			mode = "local export"
 		}
-		log.log("Starting %s...", mode)
+
+		// Guard: Skip if sync-branch == current-branch (GH#1258)
+		// Local-only mode (skipGit) doesn't use sync-branch, so skip the guard
+		if !skipGit && shouldSkipDueToSameBranch(exportCtx, store, mode, log) {
+			return
+		}
+
+		log.Info("Starting", "mode", mode)
 
 		jsonlPath := findJSONLPath()
 		if jsonlPath == "" {
-			log.log("Error: JSONL path not found")
+			log.Info("Error: beads storage file not found")
 			return
 		}
 
@@ -414,28 +498,84 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 		skip, holder, err := types.ShouldSkipDatabase(beadsDir)
 		if skip {
 			if err != nil {
-				log.log("Skipping %s (lock check failed: %v)", mode, err)
+				log.Info("Skipping (lock check failed)", "mode", mode, "error", err)
 			} else {
-				log.log("Skipping %s (locked by %s)", mode, holder)
+				log.Info("Skipping (locked)", "mode", mode, "holder", holder)
 			}
 			return
 		}
 		if holder != "" {
-			log.log("Removed stale lock (%s), proceeding", holder)
+			log.Info("Removed stale lock, proceeding", "holder", holder)
+		}
+
+		// Auto-import if JSONL has changed since last import (GH#XXXX)
+		// This prevents "refusing to export: JSONL content has changed" errors
+		// when external changes (git pull, other clones) modify JSONL between imports.
+		// Check JSONL content hash to detect external changes
+		repoKey := getRepoKeyForPath(jsonlPath)
+		if hasJSONLChanged(exportCtx, store, jsonlPath, repoKey) {
+			log.Info("JSONL changed externally, importing before export")
+
+			// Count issues before import for validation
+			beforeCount, err := countDBIssues(exportCtx, store)
+			if err != nil {
+				log.Info("Failed to count issues before auto-import", "error", err)
+				return
+			}
+
+			// Import external changes
+			if err := importToJSONLWithStore(exportCtx, store, jsonlPath); err != nil {
+				log.Info("Auto-import failed", "error", err)
+				return
+			}
+
+			// Validate import didn't cause data loss
+			afterCount, err := countDBIssues(exportCtx, store)
+			if err != nil {
+				log.Info("Failed to count issues after auto-import", "error", err)
+				return
+			}
+
+			if err := validatePostImport(beforeCount, afterCount, jsonlPath); err != nil {
+				log.Info("Post-import validation failed", "error", err)
+				return
+			}
+
+			// Update metadata hash to match imported JSONL
+			// This prevents pre-export validation from failing
+			if currentHash, err := computeJSONLHash(jsonlPath); err == nil {
+				hashKey := "jsonl_content_hash"
+				if repoKey != "" {
+					hashKey += ":" + repoKey
+				}
+				if err := store.SetMetadata(exportCtx, hashKey, currentHash); err != nil {
+					log.Info("Failed to update JSONL hash after auto-import", "error", err)
+				}
+			}
+
+			log.Info("Auto-import complete, proceeding with export")
 		}
 
 		// Pre-export validation
 		if err := validatePreExport(exportCtx, store, jsonlPath); err != nil {
-			log.log("Pre-export validation failed: %v", err)
+			log.Info("Pre-export validation failed", "error", err)
 			return
 		}
 
 		// Export to JSONL
 		if err := exportToJSONLWithStore(exportCtx, store, jsonlPath); err != nil {
-			log.log("Export failed: %v", err)
+			log.Info("Export failed", "error", err)
 			return
 		}
-		log.log("Exported to JSONL")
+		log.Info("Exported to JSONL")
+
+		// Export events to JSONL (non-fatal, opt-in via config)
+		if config.GetBool("events-export") {
+			eventsPath := filepath.Join(filepath.Dir(jsonlPath), "events.jsonl")
+			if err := exportEventsToJSONL(exportCtx, store, eventsPath); err != nil {
+				log.Info("Warning: events export failed", "error", err)
+			}
+		}
 
 		// GH#885: Defer metadata updates until AFTER git commit succeeds.
 		// This is a helper to finalize the export after git operations.
@@ -456,9 +596,14 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 			// Update database mtime to be >= JSONL mtime (fixes #278, #301, #321)
 			// This prevents validatePreExport from incorrectly blocking on next export
 			// with "JSONL is newer than database" after daemon auto-export
-			dbPath := filepath.Join(beadsDir, "beads.db")
-			if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
-				log.log("Warning: failed to update database mtime: %v", err)
+			// Dolt backend does not have a SQLite DB file; mtime touch is SQLite-only.
+			// Use store.Path() to get the actual database location, not the JSONL directory,
+			// since sync-branch exports write JSONL to a worktree but the DB stays in the main repo.
+			if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
+				dbPath := sqliteStore.Path()
+				if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
+					log.Info("Warning: failed to update database mtime", "error", err)
+				}
 			}
 		}
 
@@ -470,7 +615,7 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 			// This is critical for delete mutations to be properly reflected in the sync branch.
 			committed, err := syncBranchCommitAndPushWithOptions(exportCtx, store, autoPush, true, log)
 			if err != nil {
-				log.log("Sync branch commit failed: %v", err)
+				log.Info("Sync branch commit failed", "error", err)
 				return
 			}
 
@@ -481,17 +626,17 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 				// If sync branch not configured, use regular commit
 				hasChanges, err := gitHasChanges(exportCtx, jsonlPath)
 				if err != nil {
-					log.log("Error checking git status: %v", err)
+					log.Info("Error checking git status", "error", err)
 					return
 				}
 
 				if hasChanges {
 					message := fmt.Sprintf("bd daemon export: %s", time.Now().Format("2006-01-02 15:04:05"))
 					if err := gitCommit(exportCtx, jsonlPath, message); err != nil {
-						log.log("Commit failed: %v", err)
+						log.Info("Commit failed", "error", err)
 						return
 					}
-					log.log("Committed changes")
+					log.Info("Committed changes")
 
 					// GH#885: Finalize after git commit succeeded, before push
 					// Push failure shouldn't prevent metadata update since commit succeeded
@@ -501,10 +646,10 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 					if autoPush {
 						configuredRemote, _ := store.GetConfig(exportCtx, "sync.remote")
 						if err := gitPush(exportCtx, configuredRemote); err != nil {
-							log.log("Push failed: %v", err)
+							log.Info("Push failed", "error", err)
 							return
 						}
-						log.log("Pushed to remote")
+						log.Info("Pushed to remote")
 					}
 				} else {
 					// No git changes but export happened - finalize metadata
@@ -517,28 +662,28 @@ func performExport(ctx context.Context, store storage.Storage, autoCommit, autoP
 		}
 
 		if skipGit {
-			log.log("Local export complete")
+			log.Info("Local export complete")
 		} else {
-			log.log("Export complete")
+			log.Info("Export complete")
 		}
 	}
 }
 
 // createAutoImportFunc creates a function that pulls from git and imports JSONL
 // to database (no export). Used for file system change events.
-func createAutoImportFunc(ctx context.Context, store storage.Storage, log daemonLogger) func() {
+func createAutoImportFunc(ctx context.Context, store storage.Storage, log *slog.Logger) func() {
 	return performAutoImport(ctx, store, false, log)
 }
 
 // createLocalAutoImportFunc creates a function that imports from JSONL to database
 // without any git operations. Used for local-only mode with file system change events.
-func createLocalAutoImportFunc(ctx context.Context, store storage.Storage, log daemonLogger) func() {
+func createLocalAutoImportFunc(ctx context.Context, store storage.Storage, log *slog.Logger) func() {
 	return performAutoImport(ctx, store, true, log)
 }
 
 // performAutoImport is the shared implementation for import-only functions.
 // skipGit: if true, skips git pull operations.
-func performAutoImport(ctx context.Context, store storage.Storage, skipGit bool, log daemonLogger) func() {
+func performAutoImport(ctx context.Context, store storage.Storage, skipGit bool, log *slog.Logger) func() {
 	return func() {
 		importCtx, importCancel := context.WithTimeout(ctx, 1*time.Minute)
 		defer importCancel()
@@ -548,23 +693,35 @@ func performAutoImport(ctx context.Context, store storage.Storage, skipGit bool,
 			mode = "local auto-import"
 		}
 
+		// Skip JSONL import in dolt-native mode (JSONL is export-only backup)
+		if !ShouldImportJSONL(importCtx, store) {
+			log.Info("Skipping (dolt-native mode)", "mode", mode)
+			return
+		}
+
+		// Guard: Skip if sync-branch == current-branch (GH#1258)
+		// Local-only mode (skipGit) doesn't use sync-branch, so skip the guard
+		if !skipGit && shouldSkipDueToSameBranch(importCtx, store, mode, log) {
+			return
+		}
+
 		// Check backoff before attempting sync (skip for local mode)
 		if !skipGit {
 			jsonlPath := findJSONLPath()
 			if jsonlPath != "" {
 				beadsDir := filepath.Dir(jsonlPath)
 				if ShouldSkipSync(beadsDir) {
-					log.log("Skipping %s: in backoff period", mode)
+					log.Info("Skipping: in backoff period", "mode", mode)
 					return
 				}
 			}
 		}
 
-		log.log("Starting %s...", mode)
+		log.Info("Starting auto-import", "mode", mode)
 
 		jsonlPath := findJSONLPath()
 		if jsonlPath == "" {
-			log.log("Error: JSONL path not found")
+			log.Info("Error: beads storage file not found")
 			return
 		}
 
@@ -573,36 +730,26 @@ func performAutoImport(ctx context.Context, store storage.Storage, skipGit bool,
 		skip, holder, err := types.ShouldSkipDatabase(beadsDir)
 		if skip {
 			if err != nil {
-				log.log("Skipping %s (lock check failed: %v)", mode, err)
+				log.Info("Skipping (lock check failed)", "mode", mode, "error", err)
 			} else {
-				log.log("Skipping %s (locked by %s)", mode, holder)
+				log.Info("Skipping (locked)", "mode", mode, "holder", holder)
 			}
 			return
 		}
 		if holder != "" {
-			log.log("Removed stale lock (%s), proceeding", holder)
+			log.Info("Removed stale lock, proceeding", "holder", holder)
 		}
 
-		// Check JSONL content hash to avoid redundant imports
-		// Use content-based check (not mtime) to avoid git resurrection bug
-		// Use getRepoKeyForPath for multi-repo support
-		repoKey := getRepoKeyForPath(jsonlPath)
-		if !hasJSONLChanged(importCtx, store, jsonlPath, repoKey) {
-			log.log("Skipping %s: JSONL content unchanged", mode)
-			return
-		}
-		log.log("JSONL content changed, proceeding with %s...", mode)
-
-		// Pull from git if not in git-free mode
+		// Pull from git if not in git-free mode (do this BEFORE checking if JSONL changed)
 		if !skipGit {
 			// SAFETY CHECK: Warn if there are uncommitted local changes
 			// This helps detect race conditions where local work hasn't been pushed yet
 			jsonlPath := findJSONLPath()
 			if jsonlPath != "" {
 				if hasLocalChanges, err := gitHasChanges(importCtx, jsonlPath); err == nil && hasLocalChanges {
-					log.log("⚠️  WARNING: Uncommitted local changes detected in %s", jsonlPath)
-					log.log("   Pulling from remote may overwrite local unpushed changes.")
-					log.log("   Consider running 'bd sync' to commit and push your changes first.")
+					log.Info("WARNING: Uncommitted local changes detected", "path", jsonlPath)
+					log.Info("   Pulling from remote may overwrite local unpushed changes.")
+					log.Info("   Consider running 'bd sync' to commit and push your changes first.")
 					// Continue anyway, but user has been warned
 				}
 			}
@@ -611,7 +758,7 @@ func performAutoImport(ctx context.Context, store storage.Storage, skipGit bool,
 			pulled, err := syncBranchPull(importCtx, store, log)
 			if err != nil {
 				backoff := RecordSyncFailure(beadsDir, err.Error())
-				log.log("Sync branch pull failed: %v (backoff: %v)", err, backoff)
+				log.Info("Sync branch pull failed", "error", err, "backoff", backoff)
 				return
 			}
 
@@ -620,64 +767,75 @@ func performAutoImport(ctx context.Context, store storage.Storage, skipGit bool,
 				configuredRemote, _ := store.GetConfig(importCtx, "sync.remote")
 				if err := gitPull(importCtx, configuredRemote); err != nil {
 					backoff := RecordSyncFailure(beadsDir, err.Error())
-					log.log("Pull failed: %v (backoff: %v)", err, backoff)
+					log.Info("Pull failed", "error", err, "backoff", backoff)
 					return
 				}
-				log.log("Pulled from remote")
+				log.Info("Pulled from remote")
 			}
 		}
+
+		// Check JSONL content hash AFTER pulling to detect changes from remote
+		// Use content-based check (not mtime) to avoid git resurrection bug
+		// Use getRepoKeyForPath for multi-repo support
+		log.Info("🔍 Checking JSONL content hash AFTER pull (fix: auto-pull-not-pulling)")
+		repoKey := getRepoKeyForPath(jsonlPath)
+		if !hasJSONLChanged(importCtx, store, jsonlPath, repoKey) {
+			log.Info("Skipping: JSONL content unchanged", "mode", mode)
+			return
+		}
+		log.Info("JSONL content changed, proceeding with operation...", "mode", mode)
 
 		// Count issues before import
 		beforeCount, err := countDBIssues(importCtx, store)
 		if err != nil {
-			log.log("Failed to count issues before import: %v", err)
+			log.Info("Failed to count issues before import", "error", err)
 			return
 		}
 
 		// Import from JSONL
 		if err := importToJSONLWithStore(importCtx, store, jsonlPath); err != nil {
-			log.log("Import failed: %v", err)
+			log.Info("Import failed", "error", err)
 			return
 		}
-		log.log("Imported from JSONL")
+		log.Info("Imported from JSONL")
 
 		// Validate import
 		afterCount, err := countDBIssues(importCtx, store)
 		if err != nil {
-			log.log("Failed to count issues after import: %v", err)
+			log.Info("Failed to count issues after import", "error", err)
 			return
 		}
 
 		if err := validatePostImport(beforeCount, afterCount, jsonlPath); err != nil {
-			log.log("Post-import validation failed: %v", err)
+			log.Info("Post-import validation failed", "error", err)
 			return
 		}
 
 		if skipGit {
-			log.log("Local auto-import complete")
+			log.Info("Local auto-import complete")
 		} else {
 			// Record success to clear backoff state
 			RecordSyncSuccess(beadsDir)
-			log.log("Auto-import complete")
+			log.Info("Auto-import complete")
 		}
 	}
 }
 
 // createSyncFunc creates a function that performs full sync cycle (export, commit, pull, import, push)
-func createSyncFunc(ctx context.Context, store storage.Storage, autoCommit, autoPush bool, log daemonLogger) func() {
+func createSyncFunc(ctx context.Context, store storage.Storage, autoCommit, autoPush bool, log *slog.Logger) func() {
 	return performSync(ctx, store, autoCommit, autoPush, false, log)
 }
 
 // createLocalSyncFunc creates a function that performs local-only sync (export only, no git).
 // Used when daemon is started with --local flag.
-func createLocalSyncFunc(ctx context.Context, store storage.Storage, log daemonLogger) func() {
+func createLocalSyncFunc(ctx context.Context, store storage.Storage, log *slog.Logger) func() {
 	return performSync(ctx, store, false, false, true, log)
 }
 
 // performSync is the shared implementation for sync functions.
 // skipGit: if true, skips all git operations (commits, pulls, pushes, snapshot capture, 3-way merge, import).
 // Local-only mode only performs validation and export since there's no remote to sync with.
-func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPush, skipGit bool, log daemonLogger) func() {
+func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPush, skipGit bool, log *slog.Logger) func() {
 	return func() {
 		syncCtx, syncCancel := context.WithTimeout(ctx, 2*time.Minute)
 		defer syncCancel()
@@ -686,11 +844,18 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		if skipGit {
 			mode = "local sync cycle"
 		}
-		log.log("Starting %s...", mode)
+
+		// Guard: Skip if sync-branch == current-branch (GH#1258)
+		// Local-only mode (skipGit) doesn't use sync-branch, so skip the guard
+		if !skipGit && shouldSkipDueToSameBranch(syncCtx, store, mode, log) {
+			return
+		}
+
+		log.Info("Starting sync cycle", "mode", mode)
 
 		jsonlPath := findJSONLPath()
 		if jsonlPath == "" {
-			log.log("Error: JSONL path not found")
+			log.Info("Error: beads storage file not found")
 			return
 		}
 
@@ -702,44 +867,51 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		skip, holder, err := types.ShouldSkipDatabase(beadsDir)
 		if skip {
 			if err != nil {
-				log.log("Skipping database (lock check failed: %v)", err)
+				log.Info("Skipping database (lock check failed)", "error", err)
 			} else {
-				log.log("Skipping database (locked by %s)", holder)
+				log.Info("Skipping database (locked)", "holder", holder)
 			}
 			return
 		}
 		if holder != "" {
-			log.log("Removed stale lock (%s), proceeding with %s", holder, mode)
+			log.Info("Removed stale lock, proceeding", "holder", holder, "mode", mode)
 		}
 
 		// Integrity check: validate before export
 		if err := validatePreExport(syncCtx, store, jsonlPath); err != nil {
-			log.log("Pre-export validation failed: %v", err)
+			log.Info("Pre-export validation failed", "error", err)
 			return
 		}
 
 		// Check for duplicate IDs (database corruption)
 		if err := checkDuplicateIDs(syncCtx, store); err != nil {
-			log.log("Duplicate ID check failed: %v", err)
+			log.Info("Duplicate ID check failed", "error", err)
 			return
 		}
 
 		// Check for orphaned dependencies (warns but doesn't fail)
 		if orphaned, err := checkOrphanedDeps(syncCtx, store); err != nil {
-			log.log("Orphaned dependency check failed: %v", err)
+			log.Info("Orphaned dependency check failed", "error", err)
 		} else if len(orphaned) > 0 {
-			log.log("Found %d orphaned dependencies: %v", len(orphaned), orphaned)
+			log.Info("Found orphaned dependencies", "count", len(orphaned), "orphaned", orphaned)
 		}
 
 		if err := exportToJSONLWithStore(syncCtx, store, jsonlPath); err != nil {
-			log.log("Export failed: %v", err)
+			log.Info("Export failed", "error", err)
 			return
 		}
-		log.log("Exported to JSONL")
+		log.Info("Exported to JSONL")
+
+		// Export events to JSONL (non-fatal, opt-in via config)
+		if config.GetBool("events-export") {
+			syncEventsPath := filepath.Join(beadsDir, "events.jsonl")
+			if err := exportEventsToJSONL(syncCtx, store, syncEventsPath); err != nil {
+				log.Info("Warning: events export failed", "error", err)
+			}
+		}
 
 		// GH#885: Defer metadata updates until AFTER git commit succeeds.
 		// Define helper to finalize after git operations.
-		dbPath := filepath.Join(beadsDir, "beads.db")
 		finalizeExportMetadata := func() {
 			// Update export metadata for multi-repo support with stable keys
 			if multiRepoPaths != nil {
@@ -755,8 +927,14 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 
 			// Update database mtime to be >= JSONL mtime
 			// This prevents validatePreExport from incorrectly blocking on next export
-			if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
-				log.log("Warning: failed to update database mtime: %v", err)
+			// Dolt backend does not have a SQLite DB file; mtime touch is SQLite-only.
+			// Use store.Path() to get the actual database location, not the JSONL directory,
+			// since sync-branch exports write JSONL to a worktree but the DB stays in the main repo.
+			if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
+				dbPath := sqliteStore.Path()
+				if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
+					log.Info("Warning: failed to update database mtime", "error", err)
+				}
 			}
 		}
 
@@ -765,7 +943,14 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		if skipGit {
 			// Git-free mode: finalize immediately since there's no git to wait for
 			finalizeExportMetadata()
-			log.log("Local %s complete", mode)
+			log.Info("Local sync complete", "mode", mode)
+			return
+		}
+
+		// In dolt-native mode, JSONL is export-only backup — skip git sync and import
+		if !ShouldImportJSONL(syncCtx, store) {
+			finalizeExportMetadata()
+			log.Info("Sync complete (dolt-native mode, export-only)", "mode", mode)
 			return
 		}
 
@@ -778,15 +963,15 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 			// Multi-repo mode: snapshot each JSONL file
 			for _, path := range multiRepoPaths {
 				if err := captureLeftSnapshot(path); err != nil {
-					log.log("Error: failed to capture snapshot for %s: %v", path, err)
+					log.Info("Error: failed to capture snapshot", "path", path, "error", err)
 					return
 				}
 			}
-			log.log("Captured %d snapshots (multi-repo mode)", len(multiRepoPaths))
+			log.Info("Captured snapshots (multi-repo mode)", "count", len(multiRepoPaths))
 		} else {
 			// Single-repo mode: snapshot the main JSONL
 			if err := captureLeftSnapshot(jsonlPath); err != nil {
-				log.log("Error: failed to capture snapshot (required for deletion tracking): %v", err)
+				log.Info("Error: failed to capture snapshot", "error", err)
 				return
 			}
 		}
@@ -795,7 +980,7 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 			// Try sync branch commit first
 			committed, err := syncBranchCommitAndPush(syncCtx, store, autoPush, log)
 			if err != nil {
-				log.log("Sync branch commit failed: %v", err)
+				log.Info("Sync branch commit failed", "error", err)
 				return
 			}
 
@@ -803,17 +988,17 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 			if !committed {
 				hasChanges, err := gitHasChanges(syncCtx, jsonlPath)
 				if err != nil {
-					log.log("Error checking git status: %v", err)
+					log.Info("Error checking git status", "error", err)
 					return
 				}
 
 				if hasChanges {
 					message := fmt.Sprintf("bd daemon sync: %s", time.Now().Format("2006-01-02 15:04:05"))
 					if err := gitCommit(syncCtx, jsonlPath, message); err != nil {
-						log.log("Commit failed: %v", err)
+						log.Info("Commit failed", "error", err)
 						return
 					}
-					log.log("Committed changes")
+					log.Info("Committed changes")
 				}
 			}
 
@@ -824,7 +1009,7 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		// Pull (try sync branch first)
 		pulled, err := syncBranchPull(syncCtx, store, log)
 		if err != nil {
-			log.log("Sync branch pull failed: %v", err)
+			log.Info("Sync branch pull failed", "error", err)
 			return
 		}
 
@@ -832,16 +1017,16 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		if !pulled {
 			configuredRemote, _ := store.GetConfig(syncCtx, "sync.remote")
 			if err := gitPull(syncCtx, configuredRemote); err != nil {
-				log.log("Pull failed: %v", err)
+				log.Info("Pull failed", "error", err)
 				return
 			}
-			log.log("Pulled from remote")
+			log.Info("Pulled from remote")
 		}
 
 		// Count issues before import for validation
 		beforeCount, err := countDBIssues(syncCtx, store)
 		if err != nil {
-			log.log("Failed to count issues before import: %v", err)
+			log.Info("Failed to count issues before import", "error", err)
 			return
 		}
 
@@ -851,40 +1036,46 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 			// Multi-repo mode: merge/prune for each JSONL
 			for _, path := range multiRepoPaths {
 				if err := applyDeletionsFromMerge(syncCtx, store, path); err != nil {
-					log.log("Error during 3-way merge for %s: %v", path, err)
+					log.Info("Error during 3-way merge", "path", path, "error", err)
 					return
 				}
 			}
-			log.log("Applied deletions from %d repos", len(multiRepoPaths))
+			log.Info("Applied deletions", "repo_count", len(multiRepoPaths))
 		} else {
 			// Single-repo mode
 			if err := applyDeletionsFromMerge(syncCtx, store, jsonlPath); err != nil {
-				log.log("Error during 3-way merge: %v", err)
+				log.Info("Error during 3-way merge", "error", err)
 				return
 			}
 		}
 
 		if err := importToJSONLWithStore(syncCtx, store, jsonlPath); err != nil {
-			log.log("Import failed: %v", err)
+			log.Info("Import failed", "error", err)
 			return
 		}
-		log.log("Imported from JSONL")
+		log.Info("Imported from JSONL")
 
 		// Update database mtime after import (fixes #278, #301, #321)
 		// Sync branch import can update JSONL timestamp, so ensure DB >= JSONL
-		if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
-			log.log("Warning: failed to update database mtime: %v", err)
+		// Dolt backend does not have a SQLite DB file; mtime touch is SQLite-only.
+		// Use store.Path() to get the actual database location, not the JSONL directory,
+		// since sync-branch imports read JSONL from a worktree but the DB stays in the main repo.
+		if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
+			dbPath := sqliteStore.Path()
+			if err := TouchDatabaseFile(dbPath, jsonlPath); err != nil {
+				log.Info("Warning: failed to update database mtime", "error", err)
+			}
 		}
 
 		// Validate import didn't cause data loss
 		afterCount, err := countDBIssues(syncCtx, store)
 		if err != nil {
-			log.log("Failed to count issues after import: %v", err)
+			log.Info("Failed to count issues after import", "error", err)
 			return
 		}
 
 		if err := validatePostImport(beforeCount, afterCount, jsonlPath); err != nil {
-			log.log("Post-import validation failed: %v", err)
+			log.Info("Post-import validation failed", "error", err)
 			return
 		}
 
@@ -893,12 +1084,12 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		if multiRepoPaths != nil {
 			for _, path := range multiRepoPaths {
 				if err := updateBaseSnapshot(path); err != nil {
-					log.log("Warning: failed to update base snapshot for %s: %v", path, err)
+					log.Info("Warning: failed to update base snapshot", "path", path, "error", err)
 				}
 			}
 		} else {
 			if err := updateBaseSnapshot(jsonlPath); err != nil {
-				log.log("Warning: failed to update base snapshot: %v", err)
+				log.Info("Warning: failed to update base snapshot", "error", err)
 			}
 		}
 
@@ -908,13 +1099,13 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 			for _, path := range multiRepoPaths {
 				sm := NewSnapshotManager(path)
 				if err := sm.Cleanup(); err != nil {
-					log.log("Warning: failed to clean up snapshots for %s: %v", path, err)
+					log.Info("Warning: failed to clean up snapshots", "path", path, "error", err)
 				}
 			}
 		} else {
 			sm := NewSnapshotManager(jsonlPath)
 			if err := sm.Cleanup(); err != nil {
-				log.log("Warning: failed to clean up snapshots: %v", err)
+				log.Info("Warning: failed to clean up snapshots", "error", err)
 			}
 		}
 
@@ -922,12 +1113,12 @@ func performSync(ctx context.Context, store storage.Storage, autoCommit, autoPus
 		if autoPush && autoCommit {
 			configuredRemote, _ := store.GetConfig(syncCtx, "sync.remote")
 			if err := gitPush(syncCtx, configuredRemote); err != nil {
-				log.log("Push failed: %v", err)
+				log.Info("Push failed", "error", err)
 				return
 			}
-			log.log("Pushed to remote")
+			log.Info("Pushed to remote")
 		}
 
-		log.log("Sync cycle complete")
+		log.Info("Sync cycle complete")
 	}
 }

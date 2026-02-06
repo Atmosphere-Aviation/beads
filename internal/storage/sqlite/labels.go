@@ -19,8 +19,8 @@ func (s *SQLiteStorage) executeLabelOperation(
 	eventComment string,
 	operationError string,
 ) error {
-	return s.withTx(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, labelSQL, labelSQLArgs...)
+	return s.withTx(ctx, func(conn *sql.Conn) error {
+		result, err := conn.ExecContext(ctx, labelSQL, labelSQLArgs...)
 		if err != nil {
 			return fmt.Errorf("%s: %w", operationError, err)
 		}
@@ -34,7 +34,7 @@ func (s *SQLiteStorage) executeLabelOperation(
 			return nil
 		}
 
-		_, err = tx.ExecContext(ctx, `
+		_, err = conn.ExecContext(ctx, `
 			INSERT INTO events (issue_id, event_type, actor, comment)
 			VALUES (?, ?, ?, ?)
 		`, issueID, eventType, actor, eventComment)
@@ -43,7 +43,7 @@ func (s *SQLiteStorage) executeLabelOperation(
 		}
 
 		// Mark issue as dirty for incremental export
-		_, err = tx.ExecContext(ctx, `
+		_, err = conn.ExecContext(ctx, `
 			INSERT INTO dirty_issues (issue_id, marked_at)
 			VALUES (?, ?)
 			ON CONFLICT (issue_id) DO UPDATE SET marked_at = excluded.marked_at
@@ -170,10 +170,12 @@ func (s *SQLiteStorage) GetIssuesByLabel(ctx context.Context, label string) ([]*
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
 		       i.status, i.priority, i.issue_type, i.assignee, i.estimated_minutes,
-		       i.created_at, i.created_by, i.owner, i.updated_at, i.closed_at, i.external_ref, i.source_repo, i.close_reason,
+		       i.created_at, i.created_by, i.owner, i.updated_at, i.closed_at, i.external_ref, i.spec_id, i.source_repo, i.close_reason,
 		       i.deleted_at, i.deleted_by, i.delete_reason, i.original_type,
 		       i.sender, i.ephemeral, i.pinned, i.is_template, i.crystallizes,
-		       i.await_type, i.await_id, i.timeout_ns, i.waiters
+		       i.await_type, i.await_id, i.timeout_ns, i.waiters,
+		       i.hook_bead, i.role_bead, i.agent_state, i.last_activity, i.role_type, i.rig, i.mol_type,
+		       i.due_at, i.defer_until, i.metadata
 		FROM issues i
 		JOIN labels l ON i.id = l.issue_id
 		WHERE l.label = ?

@@ -34,12 +34,15 @@ bd info --json
 ### Find Work
 
 ```bash
-# Find ready work (no blockers)
+# Find ready work (no blockers, not already claimed)
 bd ready --json
+
+# Atomically claim an issue from the ready queue
+bd update <id> --claim --json               # Fails if already claimed
 
 # Find stale issues (not updated recently)
 bd stale --days 30 --json                    # Default: 30 days
-bd stale --days 90 --status in_progress --json  # Filter by status
+bd stale --days 90 --status in_progress --json  # Find abandoned claims
 bd stale --limit 20 --json                   # Limit results
 ```
 
@@ -62,6 +65,7 @@ bd create "Issue title" -t bug -p 1 --label bug,critical --json
 # Examples with special characters (all require quoting):
 bd create "Fix: auth doesn't validate tokens" -t bug -p 1 --json
 bd create "Add support for OAuth 2.0" -d "Implement RFC 6749 (OAuth 2.0 spec)" --json
+bd create "Implement auth" --spec-id "docs/specs/auth.md" --json
 
 # Create multiple issues from markdown file
 bd create -f feature-plan.md --json
@@ -90,6 +94,12 @@ bd create "Found bug" -t bug -p 1 --deps discovered-from:<parent-id> --json
 # Update one or more issues
 bd update <id> [<id>...] --status in_progress --json
 bd update <id> [<id>...] --priority 1 --json
+bd update <id> [<id>...] --spec-id "docs/specs/auth.md" --json
+
+# Atomically claim an issue for work (prevents race conditions)
+# Sets assignee to you and status to in_progress in one atomic operation
+# Fails if already claimed (assignee is not empty)
+bd update <id> --claim --json
 
 # Edit issue fields in $EDITOR (HUMANS ONLY - not for agents)
 # NOTE: This command is intentionally NOT exposed via the MCP server
@@ -185,6 +195,7 @@ bd list --status open --priority 1 --json               # Status and priority
 bd list --assignee alice --json                         # By assignee
 bd list --type bug --json                               # By issue type
 bd list --id bd-123,bd-456 --json                       # Specific IDs
+bd list --spec "docs/specs/" --json                     # Spec prefix
 ```
 
 ### Label Filters
@@ -333,6 +344,24 @@ bd admin cleanup --older-than 30 --force --json                   # Delete close
 bd admin cleanup --dry-run --json                                 # Preview what would be deleted
 bd admin cleanup --older-than 90 --cascade --force --json         # Delete old + dependents
 ```
+
+### Orphan Detection
+
+Find issues referenced in git commits that were never closed:
+
+```bash
+# Basic usage - scan current repo
+bd orphans
+
+# Cross-repo: scan CODE repo's commits against external BEADS database
+cd ~/my-code-repo
+bd orphans --db ~/my-beads-repo/.beads/beads.db
+
+# JSON output
+bd orphans --json
+```
+
+**Use case**: When your beads database lives in a separate repository from your code, run `bd orphans` from the code repo and point `--db` to the external database. This scans commits in your current directory while checking issue status from the specified database.
 
 ### Duplicate Detection & Merging
 
@@ -575,6 +604,51 @@ bd info --schema --json                                # Get schema, tables, con
 
 These invariants prevent data loss and would have caught issues like GH #201 (missing issue_prefix after migration).
 
+### Migrate to Sync Branch
+
+Set up a dedicated sync branch for beads data, keeping your working branches clean.
+
+```bash
+# Basic setup (creates orphan branch by default)
+bd migrate sync beads-sync                             # Create orphan sync branch
+bd migrate sync beads-sync --dry-run                   # Preview without changes
+
+# Force reconfigure if already set up
+bd migrate sync beads-sync --force                     # Reconfigure sync branch
+
+# Migrate existing non-orphan branch to orphan
+bd migrate sync beads-sync --orphan                    # Delete and recreate as orphan
+```
+
+**Behavior:**
+
+| Scenario | Result |
+|----------|--------|
+| Branch doesn't exist | Creates orphan branch (no shared history) |
+| Branch exists locally | Uses existing branch as-is |
+| Branch exists + `--orphan` | Migrates: deletes and recreates as orphan |
+| Remote only | Fetches from remote |
+| Remote only + `--orphan` | Creates local orphan (ignores remote) |
+
+**Why orphan branches?**
+
+- Clean "data sync channel" mental model
+- No accidental merge risk (git warns loudly)
+- Smaller repository footprint (no stale source code)
+- Sync branch contains only `.beads/` directory
+
+**After setup:**
+
+- `bd sync` commits beads changes to the sync branch via worktree
+- Your working branch stays clean of beads commits
+- Essential for multi-clone setups where clones work independently
+
+**Safety features for `--orphan` migration:**
+
+- **Unpushed commit check**: If the branch has unpushed commits, migration fails with a helpful error. Use `--force` to override.
+- **Existing worktree**: If a worktree exists for the branch, it's automatically removed before migration.
+- **Non-destructive to remote**: The remote branch is not modified; use `git push --force` to update it after migration.
+
 ### Daemon Management
 
 See [docs/DAEMON.md](DAEMON.md) for complete daemon management reference.
@@ -612,6 +686,41 @@ bd sync
 # 4. Import any updates
 # 5. Push to remote
 ```
+
+### Key-Value Store
+
+Store user-defined key-value pairs that persist across sessions. Useful for feature flags, environment config, or agent memory.
+
+```bash
+# Set a value
+bd kv set <key> <value>
+bd kv set feature_flag true
+bd kv set api_endpoint https://api.example.com
+
+# Get a value
+bd kv get <key>
+bd kv get feature_flag                 # Prints: true
+bd kv get missing_key                  # Prints: missing_key (not set), exits 1
+
+# Delete a key
+bd kv clear <key>
+bd kv clear feature_flag
+
+# List all key-value pairs
+bd kv list
+bd kv list --json                      # Machine-readable output
+```
+
+**Storage notes:**
+- KV data is stored in the local database with a `kv.` prefix
+- In `dolt-native` or `belt-and-suspenders` sync modes, KV data syncs via Dolt remotes
+- In `git-portable` mode, KV data stays local (not exported to JSONL)
+
+**Use cases:**
+- Feature flags: `bd set debug_mode true`
+- Environment config: `bd set staging_url https://staging.example.com`
+- Agent memory: `bd set last_migration 20240115_add_users.sql`
+- Session state: `bd set current_sprint 42`
 
 ## Issue Types
 
@@ -677,9 +786,20 @@ Default output without `--json`:
 
 ```bash
 bd ready
-# bd-42  Fix authentication bug  [P1, bug, in_progress]
-# bd-43  Add user settings page  [P2, feature, open]
+# ○ bd-42 [P1] [bug] - Fix authentication bug
+# ○ bd-43 [P2] [feature] - Add user settings page
 ```
+
+**Dependency visibility:** When issues have blocking dependencies, they appear inline:
+
+```bash
+bd list --parent epic-123
+# ○ bd-123.1 [P1] [task] - Design API (blocks: bd-123.2, bd-123.3)
+# ○ bd-123.2 [P1] [task] - Implement endpoints (blocked by: bd-123.1, blocks: bd-123.3)
+# ○ bd-123.3 [P1] [task] - Add tests (blocked by: bd-123.1, bd-123.2)
+```
+
+This makes blocking relationships visible without running `bd show` on each issue.
 
 ## Common Patterns for AI Agents
 
@@ -748,18 +868,21 @@ bd sync  # Force immediate sync, bypass debounce
 ```bash
 # Setup editor integration (choose based on your editor)
 bd setup factory  # Factory.ai Droid - creates/updates AGENTS.md (universal standard)
+bd setup codex    # Codex CLI - creates/updates AGENTS.md
 bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
 
 # Check if integration is installed
 bd setup factory --check
+bd setup codex --check
 bd setup claude --check
 bd setup cursor --check
 bd setup aider --check
 
 # Remove integration
 bd setup factory --remove
+bd setup codex --remove
 bd setup claude --remove
 bd setup cursor --remove
 bd setup aider --remove
@@ -774,6 +897,7 @@ bd setup claude --stealth    # Use stealth mode (flush only, no git operations)
 
 **What each setup does:**
 - **Factory.ai** (`bd setup factory`): Creates or updates AGENTS.md with beads workflow instructions (works with multiple AI tools using the AGENTS.md standard)
+- **Codex CLI** (`bd setup codex`): Creates or updates AGENTS.md with beads workflow instructions for Codex
 - **Claude Code** (`bd setup claude`): Adds hooks to Claude Code's settings.json that run `bd prime` on SessionStart and PreCompact events
 - **Cursor** (`bd setup cursor`): Creates `.cursor/rules/beads.mdc` with workflow instructions
 - **Aider** (`bd setup aider`): Creates `.aider.conf.yml` with bd workflow instructions

@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/lockfile"
 	"github.com/steveyegge/beads/internal/rpc"
@@ -33,20 +35,93 @@ var (
 )
 
 var (
-	executableFn             = os.Executable
-	execCommandFn            = exec.Command
-	openFileFn               = os.OpenFile
-	findProcessFn            = os.FindProcess
-	removeFileFn             = os.Remove
-	configureDaemonProcessFn = configureDaemonProcess
-	waitForSocketReadinessFn = waitForSocketReadiness
-	startDaemonProcessFn     = startDaemonProcess
-	isDaemonRunningFn        = isDaemonRunning
-	sendStopSignalFn         = sendStopSignal
+	executableFn               = os.Executable
+	execCommandFn              = exec.Command
+	openFileFn                 = os.OpenFile
+	findProcessFn              = os.FindProcess
+	removeFileFn               = os.Remove
+	configureDaemonProcessFn   = configureDaemonProcess
+	waitForSocketReadinessFn   = waitForSocketReadiness
+	startDaemonProcessFn       = startDaemonProcess
+	isDaemonRunningFn          = isDaemonRunning
+	sendStopSignalFn           = sendStopSignal
+	isDoltBackendFn            = isDoltBackendImpl
+	singleProcessOnlyBackendFn = singleProcessOnlyBackendImpl
 )
+
+// isDoltBackend returns true if the current workspace uses any Dolt backend mode.
+// The daemon is only needed for SQLite - Dolt has its own sync mechanism.
+// This is a wrapper that calls isDoltBackendFn for testability.
+func isDoltBackend() bool {
+	return isDoltBackendFn()
+}
+
+// isDoltBackendImpl is the actual implementation of isDoltBackend.
+func isDoltBackendImpl() bool {
+	beadsDir := ""
+	if dbPath != "" {
+		beadsDir = filepath.Dir(dbPath)
+	} else if found := beads.FindDatabasePath(); found != "" {
+		beadsDir = filepath.Dir(found)
+	} else {
+		beadsDir = beads.FindBeadsDir()
+	}
+	if beadsDir == "" {
+		return false
+	}
+
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return false
+	}
+	return cfg.GetBackend() == configfile.BackendDolt
+}
+
+// singleProcessOnlyBackend returns true if the current workspace backend is configured
+// as single-process-only.
+// This is a wrapper that calls singleProcessOnlyBackendFn for testability.
+func singleProcessOnlyBackend() bool {
+	return singleProcessOnlyBackendFn()
+}
+
+// singleProcessOnlyBackendImpl is the actual implementation of singleProcessOnlyBackend.
+//
+// Best-effort: if we can't determine the backend, we return false and defer to other logic.
+func singleProcessOnlyBackendImpl() bool {
+	// Prefer dbPath if set; it points to either .beads/<db>.db (sqlite) or .beads/dolt (dolt dir).
+	beadsDir := ""
+	if dbPath != "" {
+		beadsDir = filepath.Dir(dbPath)
+	} else if found := beads.FindDatabasePath(); found != "" {
+		beadsDir = filepath.Dir(found)
+	} else {
+		beadsDir = beads.FindBeadsDir()
+	}
+	if beadsDir == "" {
+		return false
+	}
+
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return false
+	}
+	// Use GetCapabilities() to properly handle Dolt server mode
+	return cfg.GetCapabilities().SingleProcessOnly
+}
 
 // shouldAutoStartDaemon checks if daemon auto-start is enabled
 func shouldAutoStartDaemon() bool {
+	// Dolt backend doesn't need daemon - it has its own sync via dolt sql-server.
+	// This applies to both embedded and server modes.
+	if isDoltBackend() {
+		return false
+	}
+
+	// For other backends, check SingleProcessOnly capability
+	if singleProcessOnlyBackend() {
+		return false
+	}
+
 	// Check BEADS_NO_DAEMON first (escape hatch for single-user workflows)
 	noDaemon := strings.ToLower(strings.TrimSpace(os.Getenv("BEADS_NO_DAEMON")))
 	if noDaemon == "1" || noDaemon == "true" || noDaemon == "yes" || noDaemon == "on" {
@@ -70,6 +145,18 @@ func shouldAutoStartDaemon() bool {
 // restartDaemonForVersionMismatch stops the old daemon and starts a new one
 // Returns true if restart was successful
 func restartDaemonForVersionMismatch() bool {
+	// Dolt backend doesn't need daemon - it has its own sync mechanism.
+	if isDoltBackend() {
+		debugLog("dolt backend: skipping daemon restart for version mismatch")
+		return false
+	}
+
+	// For other backends, check SingleProcessOnly capability
+	if singleProcessOnlyBackend() {
+		debugLog("single-process backend: skipping daemon restart for version mismatch")
+		return false
+	}
+
 	pidFile, err := getPIDFilePath()
 	if err != nil {
 		debug.Logf("failed to get PID file path: %v", err)
@@ -125,7 +212,7 @@ func restartDaemonForVersionMismatch() bool {
 		return false
 	}
 
-	args := []string{"daemon", "--start"}
+	args := []string{"daemon", "start"}
 	cmd := execCommandFn(exe, args...)
 	cmd.Env = append(os.Environ(), "BD_DAEMON_FOREGROUND=1")
 
@@ -173,6 +260,24 @@ func isDaemonRunningQuiet(pidFile string) bool {
 // tryAutoStartDaemon attempts to start the daemon in the background
 // Returns true if daemon was started successfully and socket is ready
 func tryAutoStartDaemon(socketPath string) bool {
+	// Dolt backend doesn't need daemon - it has its own sync mechanism.
+	if isDoltBackend() {
+		return false
+	}
+
+	// For other backends, check SingleProcessOnly capability
+	if singleProcessOnlyBackend() {
+		return false
+	}
+
+	// Empty dbPath causes filepath.Dir("") to return "." which breaks lock
+	// file operations. This can happen when metadata.json has an empty database
+	// field and no beads.db file exists. Skip daemon start gracefully.
+	if dbPath == "" {
+		debugLog("skipping auto-start: no database path configured")
+		return false
+	}
+
 	if !canRetryDaemonStart() {
 		debugLog("skipping auto-start due to recent failures")
 		return false
@@ -220,17 +325,29 @@ func acquireStartLock(lockPath, socketPath string) bool {
 		return false
 	}
 
-	// nolint:gosec // G304: lockPath is derived from secure beads directory
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
+	// Bounded retry loop to prevent infinite recursion when lock cleanup fails
+	const maxRetries = 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// nolint:gosec // G304: lockPath is derived from secure beads directory
+		lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			// Successfully acquired lock
+			_, _ = fmt.Fprintf(lockFile, "%d\n", os.Getpid())
+			_ = lockFile.Close() // Best-effort close during startup
+			return true
+		}
+
 		// Lock file exists - check if daemon is actually starting
 		lockPID, pidErr := readPIDFromFile(lockPath)
 		if pidErr != nil || !isPIDAlive(lockPID) {
 			// Stale lock from crashed process - clean up immediately (avoids 5s wait)
 			debugLog("startlock is stale (PID %d dead or unreadable), cleaning up", lockPID)
-			_ = os.Remove(lockPath)
-			// Retry lock acquisition after cleanup
-			return acquireStartLock(lockPath, socketPath)
+			if rmErr := removeFileFn(lockPath); rmErr != nil {
+				debugLog("failed to remove stale lock file: %v", rmErr)
+				return false // Can't acquire lock if we can't clean up
+			}
+			// Continue to next iteration to retry lock acquisition
+			continue
 		}
 
 		// PID is alive - but is daemon actually running/starting?
@@ -239,8 +356,12 @@ func acquireStartLock(lockPath, socketPath string) bool {
 		if running, _ := lockfile.TryDaemonLock(beadsDir); !running {
 			// Daemon lock not held - the start attempt failed or process was reused
 			debugLog("startlock PID %d alive but daemon lock not held, cleaning up", lockPID)
-			_ = os.Remove(lockPath)
-			return acquireStartLock(lockPath, socketPath)
+			if rmErr := removeFileFn(lockPath); rmErr != nil {
+				debugLog("failed to remove orphaned lock file: %v", rmErr)
+				return false // Can't acquire lock if we can't clean up
+			}
+			// Continue to next iteration to retry lock acquisition
+			continue
 		}
 
 		// Daemon lock is held - daemon is legitimately starting, wait for socket
@@ -248,30 +369,38 @@ func acquireStartLock(lockPath, socketPath string) bool {
 		if waitForSocketReadiness(socketPath, 5*time.Second) {
 			return true
 		}
-		return handleStaleLock(lockPath, socketPath)
+		return handleStaleLock(lockPath)
 	}
 
-	_, _ = fmt.Fprintf(lockFile, "%d\n", os.Getpid())
-	_ = lockFile.Close() // Best-effort close during startup
-	return true
+	debugLog("failed to acquire start lock after %d attempts", maxRetries)
+	return false
 }
 
-func handleStaleLock(lockPath, socketPath string) bool {
+func handleStaleLock(lockPath string) bool {
 	lockPID, err := readPIDFromFile(lockPath)
 
 	// Check if PID is dead
 	if err != nil || !isPIDAlive(lockPID) {
-		debugLog("lock is stale (PID %d dead or unreadable), removing and retrying", lockPID)
-		_ = os.Remove(lockPath)
-		return tryAutoStartDaemon(socketPath)
+		debugLog("lock is stale (PID %d dead or unreadable), removing", lockPID)
+		if rmErr := removeFileFn(lockPath); rmErr != nil {
+			debugLog("failed to remove stale lock in handleStaleLock: %v", rmErr)
+		}
+		// Return false to let caller retry. DO NOT call tryAutoStartDaemon here
+		// to avoid infinite recursion: acquireStartLock -> handleStaleLock ->
+		// tryAutoStartDaemon -> acquireStartLock -> ...
+		return false
 	}
 
 	// PID is alive - but check daemon lock as authoritative source (immune to PID reuse)
 	beadsDir := filepath.Dir(dbPath)
 	if running, _ := lockfile.TryDaemonLock(beadsDir); !running {
-		debugLog("lock PID %d alive but daemon lock not held, removing and retrying", lockPID)
-		_ = os.Remove(lockPath)
-		return tryAutoStartDaemon(socketPath)
+		debugLog("lock PID %d alive but daemon lock not held, removing", lockPID)
+		if rmErr := removeFileFn(lockPath); rmErr != nil {
+			debugLog("failed to remove orphaned lock in handleStaleLock: %v", rmErr)
+		}
+		// Return false to let caller retry. DO NOT call tryAutoStartDaemon here
+		// to avoid infinite recursion.
+		return false
 	}
 
 	// Daemon lock is held - daemon is genuinely running but socket isn't ready
@@ -330,11 +459,25 @@ func ensureLockDirectory(lockPath string) error {
 }
 
 func startDaemonProcess(socketPath string) bool {
+	// Dolt backend doesn't need daemon - it has its own sync mechanism.
+	if isDoltBackend() {
+		debugLog("dolt backend: skipping daemon start")
+		return false
+	}
+
+	// For other backends, check SingleProcessOnly capability
+	if singleProcessOnlyBackend() {
+		debugLog("single-process backend: skipping daemon start")
+		return false
+	}
+
 	// Early check: daemon requires a git repository (unless --local mode)
 	// Skip attempting to start and avoid the 5-second wait if not in git repo
 	if !isGitRepo() {
 		debugLog("not in a git repository, skipping daemon start")
-		fmt.Fprintf(os.Stderr, "%s No git repository initialized - running without background sync\n", ui.RenderMuted("Note:"))
+		if !quietFlag {
+			fmt.Fprintf(os.Stderr, "%s No git repository initialized - running without background sync\n", ui.RenderMuted("Note:"))
+		}
 		return false
 	}
 
@@ -343,9 +486,19 @@ func startDaemonProcess(socketPath string) bool {
 		binPath = os.Args[0]
 	}
 
-	args := []string{"daemon", "--start"}
+	// Keep sqlite auto-start behavior unchanged: start the daemon via the public
+	// `bd daemon start` entrypoint (it will daemonize itself as needed).
+	args := []string{"daemon", "start"}
 
 	cmd := execCommandFn(binPath, args...)
+	// Mark this as a daemon-foreground child so we don't track/kill based on the
+	// short-lived launcher process PID (see computeDaemonParentPID()).
+	// Also force the daemon to bind the same socket we're probing for readiness,
+	// avoiding any mismatch between workspace-derived paths.
+	cmd.Env = append(os.Environ(),
+		"BD_DAEMON_FOREGROUND=1",
+		"BD_SOCKET="+socketPath,
+	)
 	setupDaemonIO(cmd)
 
 	if dbPath != "" {
@@ -495,17 +648,20 @@ func getSocketPath() string {
 func emitVerboseWarning() {
 	switch daemonStatus.FallbackReason {
 	case FallbackConnectFailed:
-		fmt.Fprintf(os.Stderr, "Warning: Daemon unreachable at %s. Running in direct mode. Hint: bd daemon --status\n", daemonStatus.SocketPath)
+		fmt.Fprintf(os.Stderr, "Warning: Daemon unreachable at %s. Running in direct mode. Hint: bd daemon status\n", daemonStatus.SocketPath)
 	case FallbackHealthFailed:
-		fmt.Fprintf(os.Stderr, "Warning: Daemon unhealthy. Falling back to direct mode. Hint: bd daemon --health\n")
+		fmt.Fprintf(os.Stderr, "Warning: Daemon unhealthy. Falling back to direct mode. Hint: bd daemon status --all\n")
 	case FallbackAutoStartDisabled:
 		fmt.Fprintf(os.Stderr, "Warning: Auto-start disabled (BEADS_AUTO_START_DAEMON=false). Running in direct mode. Hint: bd daemon\n")
 	case FallbackAutoStartFailed:
-		fmt.Fprintf(os.Stderr, "Warning: Failed to auto-start daemon. Running in direct mode. Hint: bd daemon --status\n")
+		fmt.Fprintf(os.Stderr, "Warning: Failed to auto-start daemon. Running in direct mode. Hint: bd daemon status\n")
 	case FallbackDaemonUnsupported:
 		fmt.Fprintf(os.Stderr, "Warning: Daemon does not support this command yet. Running in direct mode. Hint: update daemon or use local mode.\n")
 	case FallbackWorktreeSafety:
 		// Don't warn - this is expected behavior. User can configure sync-branch to enable daemon.
+		return
+	case FallbackSingleProcessOnly:
+		// Don't warn - daemon is intentionally disabled for single-process backends (e.g., Dolt).
 		return
 	case FallbackFlagNoDaemon:
 		// Don't warn when user explicitly requested --no-daemon

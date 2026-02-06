@@ -442,12 +442,12 @@ func TestValidateForImport(t *testing.T) {
 			wantErr: false, // Should pass - federation trust model
 		},
 		{
-			name: "built-in type agent passes",
+			name: "custom type passes (federation trust)",
 			issue: Issue{
 				Title:     "Test Issue",
 				Status:    StatusOpen,
 				Priority:  1,
-				IssueType: TypeAgent, // Gas Town built-in type
+				IssueType: IssueType("agent"), // Custom type (no longer built-in)
 			},
 			wantErr: false,
 		},
@@ -539,20 +539,24 @@ func TestIssueTypeIsValid(t *testing.T) {
 		issueType IssueType
 		valid     bool
 	}{
+		// Core work types are always valid
 		{TypeBug, true},
 		{TypeFeature, true},
 		{TypeTask, true},
 		{TypeEpic, true},
 		{TypeChore, true},
-		{TypeMessage, true},
-		{TypeMergeRequest, true},
-		{TypeMolecule, true},
-		{TypeGate, true},
-		{TypeAgent, true},
-		{TypeRole, true},
-		{TypeConvoy, true},
-		{TypeEvent, true},
-		{TypeSlot, true},
+		// Gas Town types are now custom types (not built-in)
+		{IssueType("message"), false},
+		{IssueType("merge-request"), false},
+		{IssueType("molecule"), false},
+		{IssueType("gate"), false},
+		{IssueType("agent"), false},
+		{IssueType("role"), false},
+		{IssueType("convoy"), false},
+		{TypeEvent, false},
+		{IssueType("slot"), false},
+		{IssueType("rig"), false},
+		// Invalid types
 		{IssueType("invalid"), false},
 		{IssueType(""), false},
 	}
@@ -563,6 +567,59 @@ func TestIssueTypeIsValid(t *testing.T) {
 				t.Errorf("IssueType(%q).IsValid() = %v, want %v", tt.issueType, got, tt.valid)
 			}
 		})
+	}
+}
+
+// TestEventTypeValidation verifies that event type is accepted by validation
+// even without being in types.custom, since set-state creates event beads
+// internally for audit trail (GH#1356).
+func TestEventTypeValidation(t *testing.T) {
+	now := time.Now()
+	event := Issue{
+		Title:     "state change event",
+		Status:    StatusOpen,
+		Priority:  4,
+		IssueType: TypeEvent,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	// event is not a core work type
+	if TypeEvent.IsValid() {
+		t.Fatal("event should not be a core work type")
+	}
+
+	// event is an internal built-in type
+	if !TypeEvent.IsBuiltIn() {
+		t.Error("TypeEvent.IsBuiltIn() = false, want true")
+	}
+
+	// event should be accepted by IsValidWithCustom without explicit config
+	if !TypeEvent.IsValidWithCustom(nil) {
+		t.Error("TypeEvent.IsValidWithCustom(nil) = false, want true")
+	}
+
+	// ValidateWithCustom should accept event without custom types config
+	if err := event.ValidateWithCustom(nil, nil); err != nil {
+		t.Errorf("ValidateWithCustom() should accept event type, got: %v", err)
+	}
+
+	// event should also work alongside other custom types
+	if !TypeEvent.IsValidWithCustom([]string{"molecule", "gate"}) {
+		t.Error("TypeEvent.IsValidWithCustom(custom list) = false, want true")
+	}
+
+	// custom types must NOT be treated as built-in
+	if IssueType("molecule").IsBuiltIn() {
+		t.Error("IssueType(molecule).IsBuiltIn() = true, want false")
+	}
+	if IssueType("gate").IsBuiltIn() {
+		t.Error("IssueType(gate).IsBuiltIn() = true, want false")
+	}
+
+	// Normalize must not map event to a core type
+	if TypeEvent.Normalize() != TypeEvent {
+		t.Errorf("TypeEvent.Normalize() = %q, want %q", TypeEvent.Normalize(), TypeEvent)
 	}
 }
 
@@ -577,12 +634,12 @@ func TestIssueTypeRequiredSections(t *testing.T) {
 		{TypeTask, 1, "## Acceptance Criteria"},
 		{TypeEpic, 1, "## Success Criteria"},
 		{TypeChore, 0, ""},
-		{TypeMessage, 0, ""},
-		{TypeMolecule, 0, ""},
-		{TypeGate, 0, ""},
+		// Gas Town types are now custom and have no required sections
+		{IssueType("message"), 0, ""},
+		{IssueType("molecule"), 0, ""},
+		{IssueType("gate"), 0, ""},
 		{TypeEvent, 0, ""},
-		{TypeMergeRequest, 0, ""},
-		// Gas Town types (agent, role, rig, convoy, slot) have been removed
+		{IssueType("merge-request"), 0, ""},
 	}
 
 	for _, tt := range tests {

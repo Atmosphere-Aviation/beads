@@ -28,6 +28,12 @@ func ensureDatabaseFresh(ctx context.Context) error {
 		return nil
 	}
 
+	// In dolt-native mode, Dolt is the source of truth — JSONL is export-only backup.
+	// Skip the staleness check entirely since JSONL is never imported in this mode.
+	if !ShouldImportJSONL(ctx, store) {
+		return nil
+	}
+
 	// Check if database is stale
 	isStale, err := autoimport.CheckStaleness(ctx, store, dbPath)
 	if err != nil {
@@ -46,7 +52,8 @@ func ensureDatabaseFresh(ctx context.Context) error {
 	// Database is stale - auto-import to refresh (bd-9dao fix)
 	// For read-only commands running in --no-daemon mode, auto-import instead of
 	// returning an error. This allows commands like `bd show` to work after git pull.
-	if !noAutoImport {
+	// Skip auto-import if store is read-only - it can't write anyway (GH#1089)
+	if !noAutoImport && !storeIsReadOnly {
 		autoImportIfNewer()
 		return nil
 	}

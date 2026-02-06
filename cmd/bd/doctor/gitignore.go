@@ -50,6 +50,7 @@ beads.right.meta.json
 # These files are machine-specific and should not be shared across clones
 .sync.lock
 sync_base.jsonl
+export-state/
 
 # NOTE: Do NOT add negation patterns (e.g., !issues.jsonl) here.
 # They would override fork protection in .git/info/exclude, allowing
@@ -71,6 +72,7 @@ var requiredPatterns = []string{
 	"last-touched",
 	".sync.lock",
 	"sync_base.jsonl",
+	"export-state/",
 }
 
 // CheckGitignore checks if .beads/.gitignore is up to date
@@ -682,4 +684,11 @@ func FixSyncBranchGitignore() error {
 	}
 
 	return fix.SyncBranchGitignore(cwd)
+}
+
+// SetSyncBranchGitignoreFlags sets git index flags on .beads/*.jsonl files.
+// This is called directly by init when --branch is specified, bypassing the
+// GetFromYAML() check since the in-memory config may not be updated yet.
+func SetSyncBranchGitignoreFlags(path string) error {
+	return fix.SyncBranchGitignore(path)
 }

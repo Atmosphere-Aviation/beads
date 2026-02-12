@@ -1,8 +1,10 @@
+//go:build cgo
+
 // Package dolt implements the storage interface using Dolt (versioned MySQL-compatible database).
 //
 // This file implements the dolt sql-server management for federation mode.
-// When federation is enabled, we run dolt sql-server to enable multi-writer
-// support and expose the remotesapi for peer-to-peer sync.
+// When federation is enabled, we run dolt sql-server instead of the embedded driver
+// to enable multi-writer support and expose the remotesapi for peer-to-peer sync.
 package dolt
 
 import (
@@ -340,5 +342,3 @@ func isServerListening(host string, port int) bool {
 	_ = conn.Close()
 	return true
 }
-
-

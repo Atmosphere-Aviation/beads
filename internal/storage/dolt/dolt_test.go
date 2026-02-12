@@ -1,7 +1,12 @@
+//go:build cgo
+
 package dolt
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"testing"
@@ -12,6 +17,9 @@ import (
 )
 
 // testTimeout is the maximum time for any single test operation.
+// The embedded Dolt driver can be slow, especially for complex JOIN queries.
+// If tests are timing out, it may indicate an issue with the embedded Dolt
+// driver's async operations rather than with the DoltStore implementation.
 const testTimeout = 30 * time.Second
 
 // testContext returns a context with timeout for test operations
@@ -28,7 +36,21 @@ func skipIfNoDolt(t *testing.T) {
 	}
 }
 
-// setupTestStore creates a test store with a temporary directory
+// uniqueTestDBName generates a unique database name for test isolation.
+// Each test gets its own database, preventing cross-test interference and
+// avoiding any risk of connecting to production data.
+func uniqueTestDBName(t *testing.T) string {
+	t.Helper()
+	buf := make([]byte, 6)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("failed to generate random bytes: %v", err)
+	}
+	return "testdb_" + hex.EncodeToString(buf)
+}
+
+// setupTestStore creates a test store with its own isolated database.
+// Each test gets a unique database name to prevent cross-test data leakage
+// and avoid any risk of touching production data.
 func setupTestStore(t *testing.T) (*DoltStore, func()) {
 	t.Helper()
 	skipIfNoDolt(t)
@@ -41,18 +63,19 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 
+	dbName := uniqueTestDBName(t)
+
 	cfg := &Config{
 		Path:           tmpDir,
 		CommitterName:  "test",
 		CommitterEmail: "test@example.com",
-		Database:       "testdb",
+		Database:       dbName,
 	}
 
 	store, err := New(ctx, cfg)
 	if err != nil {
 		os.RemoveAll(tmpDir)
-		// Server mode requires a running Dolt server - skip if unavailable
-		t.Skipf("failed to create Dolt store: %v", err)
+		t.Fatalf("failed to create Dolt store: %v", err)
 	}
 
 	// Set up issue prefix
@@ -63,6 +86,10 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 	}
 
 	cleanup := func() {
+		// Drop the test database to avoid accumulating garbage
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dropCancel()
+		_, _ = store.db.ExecContext(dropCtx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
 		store.Close()
 		os.RemoveAll(tmpDir)
 	}
@@ -80,18 +107,22 @@ func TestNewDoltStore(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	dbName := uniqueTestDBName(t)
 	cfg := &Config{
 		Path:           tmpDir,
 		CommitterName:  "test",
 		CommitterEmail: "test@example.com",
-		Database:       "testdb",
+		Database:       dbName,
 	}
 
 	store, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatalf("failed to create Dolt store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		_, _ = store.db.ExecContext(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
+		store.Close()
+	}()
 
 	// Verify store path
 	if store.Path() != tmpDir {
@@ -685,60 +716,6 @@ func TestDoltStoreDeleteIssue(t *testing.T) {
 	}
 }
 
-func TestDoltStoreDirtyTracking(t *testing.T) {
-	store, cleanup := setupTestStore(t)
-	defer cleanup()
-
-	ctx, cancel := testContext(t)
-	defer cancel()
-
-	// Create an issue (marks it dirty)
-	issue := &types.Issue{
-		ID:          "test-dirty-issue",
-		Title:       "Dirty Issue",
-		Description: "Will be dirty",
-		Status:      types.StatusOpen,
-		Priority:    2,
-		IssueType:   types.TypeTask,
-	}
-
-	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
-		t.Fatalf("failed to create issue: %v", err)
-	}
-
-	// Get dirty issues
-	dirtyIDs, err := store.GetDirtyIssues(ctx)
-	if err != nil {
-		t.Fatalf("failed to get dirty issues: %v", err)
-	}
-	found := false
-	for _, id := range dirtyIDs {
-		if id == issue.ID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("expected issue to be in dirty list")
-	}
-
-	// Clear dirty issues
-	if err := store.ClearDirtyIssuesByID(ctx, []string{issue.ID}); err != nil {
-		t.Fatalf("failed to clear dirty issues: %v", err)
-	}
-
-	// Verify it's cleared
-	dirtyIDs, err = store.GetDirtyIssues(ctx)
-	if err != nil {
-		t.Fatalf("failed to get dirty issues after clear: %v", err)
-	}
-	for _, id := range dirtyIDs {
-		if id == issue.ID {
-			t.Error("expected issue to be cleared from dirty list")
-		}
-	}
-}
-
 func TestDoltStoreStatistics(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -825,6 +802,34 @@ func TestValidateTableName(t *testing.T) {
 			err := validateTableName(tt.tableName)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateTableName(%q) error = %v, wantErr %v", tt.tableName, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateDatabaseName(t *testing.T) {
+	tests := []struct {
+		name    string
+		dbName  string
+		wantErr bool
+	}{
+		{"valid simple", "beads", false},
+		{"valid with underscore", "beads_test", false},
+		{"valid with hyphen", "beads-test", false},
+		{"valid with numbers", "beads123", false},
+		{"empty", "", true},
+		{"too long", string(make([]byte, 100)), true},
+		{"starts with number", "123beads", true},
+		{"with backtick injection", "beads`; DROP DATABASE beads; --", true},
+		{"with space", "my database", true},
+		{"with semicolon", "beads;evil", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDatabaseName(tt.dbName)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateDatabaseName(%q) error = %v, wantErr %v", tt.dbName, err, tt.wantErr)
 			}
 		})
 	}

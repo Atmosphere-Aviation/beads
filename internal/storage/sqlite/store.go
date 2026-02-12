@@ -66,13 +66,13 @@ const reconnectTimeout = 10 * time.Second
 type SQLiteStorage struct {
 	db            *sql.DB
 	dbPath        string
-	closed        atomic.Bool  // Tracks whether Close() has been called
-	connStr       string       // Connection string for reconnection
+	closed        atomic.Bool // Tracks whether Close() has been called
+	connStr       string      // Connection string for reconnection
 	busyTimeout   time.Duration
-	readOnly      bool               // True if opened in read-only mode (GH#804)
-	freshness     *FreshnessChecker  // Optional freshness checker for daemon mode
-	reconnectMu   sync.RWMutex       // Protects reconnection and db access (GH#607)
-	activeTxCount atomic.Int64       // Tracks active transactions to block reconnect during transactions
+	readOnly      bool              // True if opened in read-only mode (GH#804)
+	freshness     *freshnessChecker // Optional freshness checker for daemon mode
+	reconnectMu   sync.RWMutex      // Protects reconnection and db access (GH#607)
+	activeTxCount atomic.Int64      // Tracks active transactions to block reconnect during transactions
 }
 
 // setupWASMCache configures WASM compilation caching to reduce SQLite startup time.
@@ -519,7 +519,7 @@ func (s *SQLiteStorage) EnableFreshnessChecking() {
 		return
 	}
 
-	s.freshness = NewFreshnessChecker(s.dbPath, s.reconnect)
+	s.freshness = newFreshnessChecker(s.dbPath, s.reconnect)
 }
 
 // DisableFreshnessChecking disables external modification detection.

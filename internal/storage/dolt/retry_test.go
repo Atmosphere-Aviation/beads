@@ -1,3 +1,5 @@
+//go:build cgo
+
 package dolt
 
 import (
@@ -43,9 +45,34 @@ func TestIsRetryableError(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:     "connection refused - not retryable",
+			name:     "connection refused - retryable (server restart)",
 			err:      errors.New("dial tcp: connection refused"),
-			expected: false,
+			expected: true,
+		},
+		{
+			name:     "database is read only - retryable",
+			err:      errors.New("cannot update manifest: database is read only"),
+			expected: true,
+		},
+		{
+			name:     "Database Is Read Only (case insensitive)",
+			err:      errors.New("Database Is Read Only"),
+			expected: true,
+		},
+		{
+			name:     "lost connection - retryable (MySQL error 2013)",
+			err:      errors.New("Error 2013: Lost connection to MySQL server during query"),
+			expected: true,
+		},
+		{
+			name:     "server gone away - retryable (MySQL error 2006)",
+			err:      errors.New("Error 2006: MySQL server has gone away"),
+			expected: true,
+		},
+		{
+			name:     "i/o timeout - retryable",
+			err:      errors.New("read tcp 127.0.0.1:3307: i/o timeout"),
+			expected: true,
 		},
 		{
 			name:     "syntax error - not retryable",
@@ -69,8 +96,26 @@ func TestIsRetryableError(t *testing.T) {
 	}
 }
 
-func TestWithRetry_Success(t *testing.T) {
-	store := &DoltStore{}
+func TestWithRetry_EmbeddedMode(t *testing.T) {
+	// In embedded mode (serverMode=false), withRetry should just call the operation once
+	store := &DoltStore{serverMode: false}
+
+	callCount := 0
+	err := store.withRetry(context.Background(), func() error {
+		callCount++
+		return errors.New("driver: bad connection")
+	})
+
+	if err == nil {
+		t.Error("expected error, got nil")
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 call in embedded mode, got %d", callCount)
+	}
+}
+
+func TestWithRetry_ServerMode_Success(t *testing.T) {
+	store := &DoltStore{serverMode: true}
 
 	callCount := 0
 	err := store.withRetry(context.Background(), func() error {
@@ -86,8 +131,8 @@ func TestWithRetry_Success(t *testing.T) {
 	}
 }
 
-func TestWithRetry_RetryOnBadConnection(t *testing.T) {
-	store := &DoltStore{}
+func TestWithRetry_ServerMode_RetryOnBadConnection(t *testing.T) {
+	store := &DoltStore{serverMode: true}
 
 	callCount := 0
 	err := store.withRetry(context.Background(), func() error {
@@ -106,8 +151,8 @@ func TestWithRetry_RetryOnBadConnection(t *testing.T) {
 	}
 }
 
-func TestWithRetry_NonRetryableError(t *testing.T) {
-	store := &DoltStore{}
+func TestWithRetry_ServerMode_NonRetryableError(t *testing.T) {
+	store := &DoltStore{serverMode: true}
 
 	callCount := 0
 	err := store.withRetry(context.Background(), func() error {
@@ -122,5 +167,3 @@ func TestWithRetry_NonRetryableError(t *testing.T) {
 		t.Errorf("expected 1 call for non-retryable error, got %d", callCount)
 	}
 }
-
-

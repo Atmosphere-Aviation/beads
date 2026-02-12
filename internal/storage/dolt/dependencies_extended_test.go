@@ -1,3 +1,5 @@
+//go:build cgo
+
 package dolt
 
 import (
@@ -11,10 +13,10 @@ import (
 // =============================================================================
 
 func TestGetDependenciesWithMetadata(t *testing.T) {
-	// Note: This test is skipped because GetDependenciesWithMetadata
+	// Note: This test is skipped in embedded Dolt mode because GetDependenciesWithMetadata
 	// makes nested GetIssue calls inside a rows cursor, which can cause connection issues.
 	// This is a known limitation of the current implementation (see bd-tdgo.3).
-	t.Skip("Skipping: GetDependenciesWithMetadata has nested query issue in Dolt mode")
+	t.Skip("Skipping: GetDependenciesWithMetadata has nested query issue in embedded Dolt mode")
 }
 
 func TestGetDependenciesWithMetadata_NoResults(t *testing.T) {
@@ -26,11 +28,11 @@ func TestGetDependenciesWithMetadata_NoResults(t *testing.T) {
 
 	// Create an issue with no dependencies
 	issue := &types.Issue{
-		ID:          "no-deps-issue",
-		Title:       "No Dependencies",
-		Status:      types.StatusOpen,
-		Priority:    2,
-		IssueType:   types.TypeTask,
+		ID:        "no-deps-issue",
+		Title:     "No Dependencies",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
 	}
 	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
 		t.Fatalf("failed to create issue: %v", err)
@@ -51,10 +53,10 @@ func TestGetDependenciesWithMetadata_NoResults(t *testing.T) {
 // =============================================================================
 
 func TestGetDependentsWithMetadata(t *testing.T) {
-	// Note: This test is skipped because GetDependentsWithMetadata
+	// Note: This test is skipped in embedded Dolt mode because GetDependentsWithMetadata
 	// makes nested GetIssue calls inside a rows cursor, which can cause connection issues.
 	// This is a known limitation of the current implementation (see bd-tdgo.3).
-	t.Skip("Skipping: GetDependentsWithMetadata has nested query issue in Dolt mode")
+	t.Skip("Skipping: GetDependentsWithMetadata has nested query issue in embedded Dolt mode")
 }
 
 // =============================================================================
@@ -427,25 +429,30 @@ func TestDetectCycles_WithCycle(t *testing.T) {
 		}
 	}
 
-	// Create cycle
-	deps := []*types.Dependency{
-		{IssueID: issueA.ID, DependsOnID: issueB.ID, Type: types.DepBlocks},
-		{IssueID: issueB.ID, DependsOnID: issueC.ID, Type: types.DepBlocks},
-		{IssueID: issueC.ID, DependsOnID: issueA.ID, Type: types.DepBlocks}, // Creates cycle
+	// First two deps succeed
+	dep1 := &types.Dependency{IssueID: issueA.ID, DependsOnID: issueB.ID, Type: types.DepBlocks}
+	if err := store.AddDependency(ctx, dep1, "tester"); err != nil {
+		t.Fatalf("failed to add dependency A->B: %v", err)
 	}
-	for _, d := range deps {
-		if err := store.AddDependency(ctx, d, "tester"); err != nil {
-			t.Fatalf("failed to add dependency: %v", err)
-		}
+	dep2 := &types.Dependency{IssueID: issueB.ID, DependsOnID: issueC.ID, Type: types.DepBlocks}
+	if err := store.AddDependency(ctx, dep2, "tester"); err != nil {
+		t.Fatalf("failed to add dependency B->C: %v", err)
 	}
 
+	// Third dep would create cycle - should be rejected
+	dep3 := &types.Dependency{IssueID: issueC.ID, DependsOnID: issueA.ID, Type: types.DepBlocks}
+	if err := store.AddDependency(ctx, dep3, "tester"); err == nil {
+		t.Fatal("expected AddDependency to fail when creating cycle, but it succeeded")
+	}
+
+	// Since cycle was prevented, DetectCycles should find nothing
 	cycles, err := store.DetectCycles(ctx)
 	if err != nil {
 		t.Fatalf("DetectCycles failed: %v", err)
 	}
 
-	if len(cycles) == 0 {
-		t.Error("expected to find a cycle")
+	if len(cycles) != 0 {
+		t.Errorf("expected no cycles since cycle was prevented, got %d", len(cycles))
 	}
 }
 
@@ -674,5 +681,3 @@ func TestAddDependency_MultipleExternalReferences(t *testing.T) {
 }
 
 // Note: testContext is already defined in dolt_test.go for this package
-
-

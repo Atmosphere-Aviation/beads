@@ -73,32 +73,13 @@ Examples:
 		var stats *types.Statistics
 		var err error
 
-		// Check database freshness before reading (bd-2q6d, bd-c4rq)
-		// Skip check when using daemon (daemon auto-imports on staleness)
 		ctx := rootCtx
-		if daemonClient == nil {
-			if err := ensureDatabaseFresh(ctx); err != nil {
-				FatalErrorRespectJSON("%v", err)
-			}
-		}
+		requireFreshDB(ctx)
 
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			resp, rpcErr := daemonClient.Stats()
-			if rpcErr != nil {
-				FatalErrorRespectJSON("%v", rpcErr)
-			}
-
-			if err := json.Unmarshal(resp.Data, &stats); err != nil {
-				FatalErrorRespectJSON("parsing response: %v", err)
-			}
-		} else {
-			// Direct mode
-			ctx := rootCtx
-			stats, err = store.GetStatistics(ctx)
-			if err != nil {
-				FatalErrorRespectJSON("%v", err)
-			}
+		// Direct mode
+		stats, err = store.GetStatistics(ctx)
+		if err != nil {
+			FatalErrorRespectJSON("%v", err)
 		}
 
 		// Filter by assignee if requested (overrides stats with filtered counts)

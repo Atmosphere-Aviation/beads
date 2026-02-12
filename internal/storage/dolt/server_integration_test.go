@@ -1,3 +1,5 @@
+//go:build cgo
+
 package dolt
 
 import (
@@ -57,6 +59,7 @@ func TestServerModeConnection(t *testing.T) {
 	store, err := New(ctx, &Config{
 		Path:       tmpDir,
 		Database:   "beads",
+		ServerMode: true,
 		ServerHost: "127.0.0.1",
 		ServerPort: 13307,
 	})

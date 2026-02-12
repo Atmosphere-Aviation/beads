@@ -228,14 +228,14 @@ func (t *sqliteTxStorage) CreateIssue(ctx context.Context, issue *types.Issue, a
 		// Validate that explicitly provided ID matches the configured prefix
 		// Skip validation when PrefixOverride is set (cross-rig creation)
 		if !skipPrefixValidation {
-			if err := ValidateIssueIDPrefix(issue.ID, prefix); err != nil {
+			if err := validateIssueIDPrefix(issue.ID, prefix); err != nil {
 				return fmt.Errorf("failed to validate issue ID prefix: %w", err)
 			}
 		}
 
 		// For hierarchical IDs (bd-a3f8e9.1), ensure parent exists
-		// Use IsHierarchicalID to correctly handle prefixes with dots (GH#508)
-		if isHierarchical, parentID := IsHierarchicalID(issue.ID); isHierarchical {
+		// Use isHierarchicalID to correctly handle prefixes with dots (GH#508)
+		if isHierarchical, parentID := isHierarchicalID(issue.ID); isHierarchical {
 			// Try to resurrect entire parent chain if any parents are missing
 			resurrected, err := t.parent.tryResurrectParentChainWithConn(ctx, t.conn, issue.ID)
 			if err != nil {
@@ -342,7 +342,7 @@ func (t *sqliteTxStorage) CreateIssues(ctx context.Context, issues []*types.Issu
 			}
 			issue.ID = generatedID
 		} else {
-			if err := ValidateIssueIDPrefix(issue.ID, prefix); err != nil {
+			if err := validateIssueIDPrefix(issue.ID, prefix); err != nil {
 				return fmt.Errorf("failed to validate issue ID prefix: %w", err)
 			}
 		}
@@ -778,7 +778,7 @@ func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependen
 	}
 
 	// External refs (external:<project>:<capability>) don't need target validation
-	// They are resolved lazily at query time by CheckExternalDep
+	// They are resolved lazily at query time by checkExternalDep
 	isExternalRef := strings.HasPrefix(dep.DependsOnID, "external:")
 
 	var dependsOnExists *types.Issue
@@ -796,13 +796,13 @@ func (t *sqliteTxStorage) AddDependency(ctx context.Context, dep *types.Dependen
 			return fmt.Errorf("issue cannot depend on itself")
 		}
 
-		// Validate parent-child dependency direction (only for local deps)
-		if dep.Type == types.DepParentChild {
-			if issueExists.IssueType == types.TypeEpic && dependsOnExists.IssueType != types.TypeEpic {
-				return fmt.Errorf("invalid parent-child dependency: parent (%s) cannot depend on child (%s). Use: bd dep add %s %s --type parent-child",
-					dep.IssueID, dep.DependsOnID, dep.DependsOnID, dep.IssueID)
-			}
-		}
+		// Parent-child direction validation note:
+		// The previous type-based check (Epic can't depend on non-Epic) was removed because
+		// it incorrectly rejected valid hierarchies involving custom types (e.g., theme → epic).
+		// Custom types like "theme" or "shot" are valid parents for built-in types like "epic"
+		// or "task". Cycle detection in this function and higher-level relationship constraints
+		// already prevent the actual problematic cases (circular dependencies and duplicate
+		// hierarchical links).
 	}
 
 	if dep.CreatedAt.IsZero() {
@@ -1081,7 +1081,7 @@ func (t *sqliteTxStorage) GetConfig(ctx context.Context, key string) (string, er
 
 // GetCustomStatuses retrieves the list of custom status states from config within the transaction.
 func (t *sqliteTxStorage) GetCustomStatuses(ctx context.Context) ([]string, error) {
-	value, err := t.GetConfig(ctx, CustomStatusConfigKey)
+	value, err := t.GetConfig(ctx, customStatusConfigKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1093,7 +1093,7 @@ func (t *sqliteTxStorage) GetCustomStatuses(ctx context.Context) ([]string, erro
 
 // GetCustomTypes retrieves the list of custom issue types from config within the transaction.
 func (t *sqliteTxStorage) GetCustomTypes(ctx context.Context) ([]string, error) {
-	value, err := t.GetConfig(ctx, CustomTypeConfigKey)
+	value, err := t.GetConfig(ctx, customTypeConfigKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1416,9 +1416,11 @@ func (t *sqliteTxStorage) SearchIssues(ctx context.Context, query string, filter
 	}
 
 	// Parent filtering: filter children by parent issue
+	// Also includes dotted-ID children (e.g., "parent.1.2" is child of "parent")
 	if filter.ParentID != nil {
-		whereClauses = append(whereClauses, "id IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child' AND depends_on_id = ?)")
-		args = append(args, *filter.ParentID)
+		parentID := *filter.ParentID
+		whereClauses = append(whereClauses, "(id IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child' AND depends_on_id = ?) OR id LIKE ? || '.%')")
+		args = append(args, parentID, parentID)
 	}
 
 	whereSQL := ""

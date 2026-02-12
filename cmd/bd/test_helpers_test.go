@@ -1,9 +1,13 @@
+//go:build cgo
+
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +17,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/sqlite"
 )
 
@@ -61,6 +66,49 @@ func ensureCleanGlobalState(t *testing.T) {
 	t.Helper()
 	// Reset CommandContext so accessor functions fall back to globals
 	resetCommandContext()
+}
+
+// savedGlobals holds a snapshot of package-level globals for safe restoration.
+// Used by saveAndRestoreGlobals to ensure test isolation.
+type savedGlobals struct {
+	dbPath           string
+	store            storage.Storage
+	storeActive      bool
+	autoFlushEnabled bool
+}
+
+// saveAndRestoreGlobals snapshots all commonly-mutated package-level globals
+// and registers a t.Cleanup() to restore them when the test completes.
+// This replaces the fragile manual save/defer pattern:
+//
+//	oldDBPath := dbPath
+//	defer func() { dbPath = oldDBPath }()
+//
+// With the safer:
+//
+//	saveAndRestoreGlobals(t)
+//
+// Benefits:
+//   - All globals saved atomically (can't forget one)
+//   - t.Cleanup runs even on panic (no risk of missed defer registration)
+//   - Single call replaces multiple save/defer pairs
+func saveAndRestoreGlobals(t *testing.T) *savedGlobals {
+	t.Helper()
+	saved := &savedGlobals{
+		dbPath:           dbPath,
+		store:            store,
+		storeActive:      storeActive,
+		autoFlushEnabled: autoFlushEnabled,
+	}
+	t.Cleanup(func() {
+		dbPath = saved.dbPath
+		store = saved.store
+		storeMutex.Lock()
+		storeActive = saved.storeActive
+		storeMutex.Unlock()
+		autoFlushEnabled = saved.autoFlushEnabled
+	})
+	return saved
 }
 
 // failIfProductionDatabase checks if the database path is in a production directory
@@ -114,7 +162,7 @@ func failIfProductionDatabase(t *testing.T, dbPath string) {
 
 // newTestStore creates a SQLite store with issue_prefix configured (bd-166)
 // This prevents "database not initialized" errors in tests
-func newTestStore(t *testing.T, dbPath string) *sqlite.SQLiteStorage {
+func newTestStore(t *testing.T, dbPath string) storage.Storage {
 	t.Helper()
 
 	// CRITICAL (bd-2c5a): Ensure we're not polluting production database
@@ -147,7 +195,7 @@ func newTestStore(t *testing.T, dbPath string) *sqlite.SQLiteStorage {
 }
 
 // newTestStoreWithPrefix creates a SQLite store with custom issue_prefix configured
-func newTestStoreWithPrefix(t *testing.T, dbPath string, prefix string) *sqlite.SQLiteStorage {
+func newTestStoreWithPrefix(t *testing.T, dbPath string, prefix string) storage.Storage {
 	t.Helper()
 
 	// CRITICAL (bd-2c5a): Ensure we're not polluting production database
@@ -181,7 +229,7 @@ func newTestStoreWithPrefix(t *testing.T, dbPath string, prefix string) *sqlite.
 
 // openExistingTestDB opens an existing database without modifying it.
 // Used in tests where the database was already created by the code under test.
-func openExistingTestDB(t *testing.T, dbPath string) (*sqlite.SQLiteStorage, error) {
+func openExistingTestDB(t *testing.T, dbPath string) (storage.Storage, error) {
 	t.Helper()
 	return sqlite.New(context.Background(), dbPath)
 }
@@ -202,4 +250,31 @@ func runCommandInDirWithOutput(dir string, name string, args ...string) (string,
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+// captureStderr captures stderr output from fn and returns it as a string.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&buf, r)
+		close(done)
+	}()
+
+	fn()
+	_ = w.Close()
+	os.Stderr = old
+	<-done
+	_ = r.Close()
+
+	return buf.String()
 }

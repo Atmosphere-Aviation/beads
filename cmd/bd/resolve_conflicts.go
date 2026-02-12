@@ -29,10 +29,10 @@ Modes:
   mechanical (default)  Uses deterministic merge rules (updated_at wins, etc.)
   interactive           Prompts for each conflict (not yet implemented)
 
-The file defaults to .beads/beads.jsonl if not specified.
+The file defaults to .beads/issues.jsonl if not specified.
 
 Examples:
-  bd resolve-conflicts                    # Resolve conflicts in .beads/beads.jsonl
+  bd resolve-conflicts                    # Resolve conflicts in .beads/issues.jsonl
   bd resolve-conflicts --dry-run          # Show what would be resolved
   bd resolve-conflicts custom.jsonl       # Resolve conflicts in custom file
   bd resolve-conflicts --json             # Output results as JSON`,
@@ -59,25 +59,25 @@ func init() {
 
 // conflictRegion represents a single conflict in the file
 type conflictRegion struct {
-	StartLine int      // Line number where <<<<<<< starts
-	EndLine   int      // Line number where >>>>>>> ends
-	LeftSide  []string // Lines between <<<<<<< and =======
-	RightSide []string // Lines between ======= and >>>>>>>
-	LeftLabel string   // Label after <<<<<<< (e.g., "HEAD")
-	RightLabel string  // Label after >>>>>>> (e.g., "branch-name")
+	StartLine  int      // Line number where <<<<<<< starts
+	EndLine    int      // Line number where >>>>>>> ends
+	LeftSide   []string // Lines between <<<<<<< and =======
+	RightSide  []string // Lines between ======= and >>>>>>>
+	LeftLabel  string   // Label after <<<<<<< (e.g., "HEAD")
+	RightLabel string   // Label after >>>>>>> (e.g., "branch-name")
 }
 
 // resolveConflictsResult is the JSON output structure
 type resolveConflictsResult struct {
-	FilePath         string                   `json:"file_path"`
-	DryRun           bool                     `json:"dry_run"`
-	Mode             string                   `json:"mode"`
-	ConflictsFound   int                      `json:"conflicts_found"`
-	ConflictsResolved int                     `json:"conflicts_resolved"`
-	Status           string                   `json:"status"` // "success", "no_conflicts", "dry_run", "error"
-	BackupPath       string                   `json:"backup_path,omitempty"`
-	Error            string                   `json:"error,omitempty"`
-	Conflicts        []conflictResolutionInfo `json:"conflicts,omitempty"`
+	FilePath          string                   `json:"file_path"`
+	DryRun            bool                     `json:"dry_run"`
+	Mode              string                   `json:"mode"`
+	ConflictsFound    int                      `json:"conflicts_found"`
+	ConflictsResolved int                      `json:"conflicts_resolved"`
+	Status            string                   `json:"status"` // "success", "no_conflicts", "dry_run", "error"
+	BackupPath        string                   `json:"backup_path,omitempty"`
+	Error             string                   `json:"error,omitempty"`
+	Conflicts         []conflictResolutionInfo `json:"conflicts,omitempty"`
 }
 
 type conflictResolutionInfo struct {
@@ -94,7 +94,7 @@ func runResolveConflicts(cmd *cobra.Command, args []string) {
 	if len(args) > 0 {
 		filePath = args[0]
 	} else {
-		filePath = filepath.Join(resolveConflictsPath, ".beads", "beads.jsonl")
+		filePath = defaultResolveConflictsFilePath(resolveConflictsPath)
 	}
 
 	// Validate mode
@@ -219,6 +219,10 @@ func runResolveConflicts(cmd *cobra.Command, args []string) {
 	}
 }
 
+func defaultResolveConflictsFilePath(rootPath string) string {
+	return filepath.Join(rootPath, ".beads", "issues.jsonl")
+}
+
 // parseConflicts extracts conflict regions and non-conflicted lines from content
 func parseConflicts(content string) ([]conflictRegion, []string, error) {
 	var conflicts []conflictRegion
@@ -240,8 +244,8 @@ func parseConflicts(content string) ([]conflictRegion, []string, error) {
 				return nil, nil, fmt.Errorf("nested conflict at line %d", lineNum)
 			}
 			current = &conflictRegion{
-				StartLine:  lineNum,
-				LeftLabel:  strings.TrimSpace(strings.TrimPrefix(line, "<<<<<<<")),
+				StartLine: lineNum,
+				LeftLabel: strings.TrimSpace(strings.TrimPrefix(line, "<<<<<<<")),
 			}
 			inLeft = true
 			continue

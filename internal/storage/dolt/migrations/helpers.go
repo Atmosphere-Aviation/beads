@@ -1,3 +1,5 @@
+//go:build cgo
+
 package migrations
 
 import (
@@ -36,5 +38,3 @@ func tableExists(db *sql.DB, table string) (bool, error) {
 	}
 	return count > 0, nil
 }
-
-

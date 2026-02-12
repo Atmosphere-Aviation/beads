@@ -1,3 +1,5 @@
+//go:build cgo
+
 package dolt
 
 import (
@@ -65,7 +67,7 @@ func (s *DoltStore) Diff(ctx context.Context, fromRef, toRef string) ([]*storage
 		FROM dolt_diff('%s', '%s', 'issues')
 	`, fromRef, toRef)
 
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.queryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get diff: %w", err)
 	}
@@ -143,7 +145,7 @@ func (s *DoltStore) Diff(ctx context.Context, fromRef, toRef string) ([]*storage
 // ListBranches returns the names of all branches.
 // Implements storage.VersionedStorage.
 func (s *DoltStore) ListBranches(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT name FROM dolt_branches ORDER BY name")
+	rows, err := s.queryContext(ctx, "SELECT name FROM dolt_branches ORDER BY name")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list branches: %w", err)
 	}
@@ -224,7 +226,8 @@ func (s *DoltStore) GetChangesSinceExport(ctx context.Context, fromCommit string
 	}
 
 	// If fromCommit equals HEAD, there are no changes.
-	// Note: This also avoids issues when querying dolt_diff with identical from/to refs.
+	// Note: This also avoids a nil pointer panic in the embedded Dolt driver
+	// when querying dolt_diff with identical from/to refs.
 	if fromCommit == currentCommit {
 		return &ExportChanges{Entries: nil}, nil
 	}
@@ -265,5 +268,3 @@ func (s *DoltStore) CommitExists(ctx context.Context, commitHash string) (bool, 
 
 	return count > 0, nil
 }
-
-

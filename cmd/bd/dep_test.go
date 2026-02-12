@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -577,10 +579,10 @@ func TestOutputMermaidTree_Siblings(t *testing.T) {
 
 	// Verify incorrect edges do NOT exist (siblings shouldn't be connected)
 	incorrectEdges := []string{
-		"BD-2 --> BD-3",   // Siblings shouldn't be connected
-		"BD-3 --> BD-4",   // BD-4's parent is BD-2, not BD-3
-		"BD-4 --> BD-3",   // Wrong direction
-		"BD-4 --> BD-5",   // These are cousins, not parent-child
+		"BD-2 --> BD-3", // Siblings shouldn't be connected
+		"BD-3 --> BD-4", // BD-4's parent is BD-2, not BD-3
+		"BD-4 --> BD-3", // Wrong direction
+		"BD-4 --> BD-5", // These are cousins, not parent-child
 	}
 
 	for _, edge := range incorrectEdges {
@@ -994,11 +996,11 @@ func TestMergeBidirectionalTrees_MultipleDepth(t *testing.T) {
 
 	// Verify all IDs are present (except we might have root twice from both trees)
 	expectedIDs := map[string]bool{
-		"root":            false,
-		"dep-1":           false,
-		"dep-1-1":         false,
-		"dependent-1":     false,
-		"dependent-1-1":   false,
+		"root":          false,
+		"dep-1":         false,
+		"dep-1-1":       false,
+		"dependent-1":   false,
+		"dependent-1-1": false,
 	}
 
 	for _, node := range result {
@@ -1558,6 +1560,11 @@ func TestDepListCrossRigRouting(t *testing.T) {
 	}
 	if err := rigStore.AddDependency(ctx, dep, "test"); err != nil {
 		t.Fatalf("Failed to add dependency: %v", err)
+	}
+
+	// Close rig store to release Dolt lock before routing opens it
+	if closer, ok := rigStore.(io.Closer); ok {
+		closer.Close()
 	}
 
 	// Create routes.jsonl in town .beads directory

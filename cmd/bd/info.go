@@ -210,6 +210,54 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "0.55.1",
+		Date:    "2026-02-20",
+		Changes: []string{
+			"FIX: Release workflow YAML broken by heredoc in zig wrapper step",
+			"FIX: Version consistency (marketplace.json missed in v0.55.0 bump)",
+			"FIX: Go formatting and lint issues in 9 files",
+		},
+	},
+	{
+		Version: "0.55.0",
+		Date:    "2026-02-20",
+		Changes: []string{
+			"FIX: Release CI upgraded zig 0.13→0.14 fixing AccessDenied cross-compilation bug",
+			"FIX: macOS libresolv resolution with zig 0.14 (-lresolv.9 workaround)",
+			"FIX: 5 pre-existing test failures and Dolt panic resolved",
+			"REMOVED: ~5K lines dead code from classic sync cleanup",
+		},
+	},
+	{
+		Version: "0.54.0",
+		Date:    "2026-02-18",
+		Changes: []string{
+			"FIX: Release CI zig cross-compilation cache race (--parallelism 1)",
+			"FIX: Android ARM64 build uses CGO_ENABLED=0 (server mode only)",
+			"FIX: macOS cross-builds use netgo tag with zig 0.14.0",
+		},
+	},
+	{
+		Version: "0.53.0",
+		Date:    "2026-02-18",
+		Changes: []string{
+			"NEW: Dolt-in-Git sync — native Dolt push/pull via git remotes replaces JSONL pipeline",
+			"NEW: bd dolt start/stop — explicit Dolt server management (#1813)",
+			"NEW: bd dolt commit — desire-path ergonomics for Dolt data",
+			"NEW: Server mode without CGO — OpenFromConfig exported (#1805)",
+			"NEW: Hosted Dolt support — TLS, auth, explicit branch config",
+			"NEW: bd mol wisp gc --closed for bulk purge of closed wisps",
+			"NEW: Storage interface decouples from concrete DoltStore",
+			"NEW: Lock health diagnostics in bd doctor",
+			"FIX: Pre-commit deadlock on embedded Dolt (#1841)",
+			"FIX: bd doctor --fix hang — run fixes in-process (#1850)",
+			"FIX: Dolt lock errors surfaced with guidance (#1816)",
+			"FIX: BEADS_DIR config loading (#1854)",
+			"REMOVED: JSONL sync-branch pipeline (~11,000 lines deleted)",
+			"REMOVED: Daemon infrastructure, 3-way merge remnants, dead stubs",
+		},
+	},
+	{
 		Version: "0.52.0",
 		Date:    "2026-02-16",
 		Changes: []string{

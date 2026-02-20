@@ -130,15 +130,8 @@ func Initialize() error {
 	v.SetDefault("actor", "")
 	v.SetDefault("issue-prefix", "")
 	// Additional environment variables (not prefixed with BD_)
-	// These are bound explicitly for backward compatibility
-	_ = v.BindEnv("flush-debounce", "BEADS_FLUSH_DEBOUNCE")             // BindEnv only fails with zero args, which can't happen here
-	_ = v.BindEnv("identity", "BEADS_IDENTITY")                         // BindEnv only fails with zero args, which can't happen here
-	_ = v.BindEnv("remote-sync-interval", "BEADS_REMOTE_SYNC_INTERVAL") // BindEnv only fails with zero args, which can't happen here
-
-	// Set defaults for additional settings
-	v.SetDefault("flush-debounce", "30s")
+	_ = v.BindEnv("identity", "BEADS_IDENTITY") // BindEnv only fails with zero args, which can't happen here
 	v.SetDefault("identity", "")
-	v.SetDefault("remote-sync-interval", "30s")
 
 	// Dolt configuration defaults
 	// Controls whether beads should automatically create Dolt commits after write commands.
@@ -156,7 +149,7 @@ func Initialize() error {
 
 	// Sync mode configuration (hq-ew1mbr.3)
 	// See docs/CONFIG.md for detailed documentation
-	v.SetDefault("sync.mode", SyncModeGitPortable)  // git-portable | realtime | dolt-native | belt-and-suspenders
+	v.SetDefault("sync.mode", SyncModeGitPortable)  // git-portable | dolt-native | belt-and-suspenders
 	v.SetDefault("sync.export_on", SyncTriggerPush) // push | change
 	v.SetDefault("sync.import_on", SyncTriggerPull) // pull | change
 
@@ -660,7 +653,7 @@ func GetIdentity(flagValue string) string {
 
 // SyncConfig holds the sync mode configuration.
 type SyncConfig struct {
-	Mode     SyncMode // git-portable, realtime, dolt-native, belt-and-suspenders
+	Mode     SyncMode // git-portable, dolt-native, belt-and-suspenders
 	ExportOn string   // push, change
 	ImportOn string   // pull, change
 }
@@ -749,41 +742,6 @@ func GetFederationConfig() FederationConfig {
 		Remote:      GetString("federation.remote"),
 		Sovereignty: GetSovereignty(),
 	}
-}
-
-// IsSyncModeValid checks if the given sync mode string is valid.
-func IsSyncModeValid(mode string) bool {
-	return validSyncModes[SyncMode(mode)]
-}
-
-// IsConflictStrategyValid checks if the given conflict strategy string is valid.
-func IsConflictStrategyValid(strategy string) bool {
-	return validConflictStrategies[ConflictStrategy(strategy)]
-}
-
-// IsSovereigntyValid checks if the given sovereignty tier string is valid.
-// Note: empty string is valid (means no restriction).
-func IsSovereigntyValid(sovereignty string) bool {
-	if sovereignty == "" {
-		return true
-	}
-	return validSovereigntyTiers[Sovereignty(sovereignty)]
-}
-
-// ShouldExportOnChange returns true if sync.export_on is set to "change".
-func ShouldExportOnChange() bool {
-	return GetString("sync.export_on") == SyncTriggerChange
-}
-
-// ShouldImportOnChange returns true if sync.import_on is set to "change".
-func ShouldImportOnChange() bool {
-	return GetString("sync.import_on") == SyncTriggerChange
-}
-
-// NeedsDoltRemote returns true if the sync mode requires a Dolt remote.
-func NeedsDoltRemote() bool {
-	mode := GetSyncMode()
-	return mode == SyncModeDoltNative || mode == SyncModeBeltAndSuspenders
 }
 
 // GetCustomTypesFromYAML retrieves custom issue types from config.yaml.

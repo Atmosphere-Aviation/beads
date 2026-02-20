@@ -13,7 +13,6 @@ import (
 	"github.com/spf13/viper"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/syncbranch"
 )
 
 // gitSSHRemotePattern matches standard git SSH remote URLs (user@host:path)
@@ -115,17 +114,9 @@ var configSetCmd = &cobra.Command{
 
 		ctx := rootCtx
 
-		// Special handling for sync.branch to apply validation
-		if strings.TrimSpace(key) == syncbranch.ConfigKey {
-			if err := syncbranch.Set(ctx, store, value); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			if err := store.SetConfig(ctx, key, value); err != nil {
-				fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
-				os.Exit(1)
-			}
+		if err := store.SetConfig(ctx, key, value); err != nil {
+			fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
+			os.Exit(1)
 		}
 
 		if jsonOutput {
@@ -201,12 +192,7 @@ var configGetCmd = &cobra.Command{
 		var value string
 		var err error
 
-		// Special handling for sync.branch to support env var override
-		if strings.TrimSpace(key) == syncbranch.ConfigKey {
-			value, err = syncbranch.Get(ctx, store)
-		} else {
-			value, err = store.GetConfig(ctx, key)
-		}
+		value, err = store.GetConfig(ctx, key)
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting config: %v\n", err)
@@ -269,31 +255,15 @@ var configListCmd = &cobra.Command{
 
 		// Check for config.yaml overrides that take precedence (bd-20j)
 		// This helps diagnose when effective config differs from database config
-		showConfigYAMLOverrides(config)
+		showConfigYAMLOverrides()
 	},
 }
 
 // showConfigYAMLOverrides warns when config.yaml or env vars override database settings.
 // This addresses the confusion when `bd config list` shows one value but the effective
 // value used by commands is different due to higher-priority config sources.
-func showConfigYAMLOverrides(dbConfig map[string]string) {
-	var overrides []string
-
-	// Check sync.branch - can be overridden by BEADS_SYNC_BRANCH env var or config.yaml sync-branch
-	if dbSyncBranch, ok := dbConfig[syncbranch.ConfigKey]; ok && dbSyncBranch != "" {
-		effectiveBranch := syncbranch.GetFromYAML()
-		if effectiveBranch != "" && effectiveBranch != dbSyncBranch {
-			overrides = append(overrides, fmt.Sprintf("  sync.branch: database has '%s' but effective value is '%s' (from config.yaml or env)", dbSyncBranch, effectiveBranch))
-		}
-	}
-
-	if len(overrides) > 0 {
-		fmt.Println("\n⚠️  Config overrides (higher priority sources):")
-		for _, o := range overrides {
-			fmt.Println(o)
-		}
-		fmt.Println("\nNote: config.yaml and environment variables take precedence over database config.")
-	}
+// TODO(bd-20j): implement override detection logic
+func showConfigYAMLOverrides() {
 }
 
 var configUnsetCmd = &cobra.Command{
@@ -331,12 +301,11 @@ var configValidateCmd = &cobra.Command{
 	Long: `Validate sync-related configuration settings.
 
 Checks:
-  - sync.mode is a valid value (local, git-branch, external)
-  - conflict.strategy is valid (lww, manual, ours, theirs)
-  - federation.sovereignty is valid (if set)
+  - sync.mode is a valid value (git-portable, dolt-native, belt-and-suspenders)
+  - conflict.strategy is valid (newest, ours, theirs, manual)
+  - federation.sovereignty is valid (T1, T2, T3, T4, or empty)
   - federation.remote is set when sync.mode requires it
   - Remote URL format is valid (dolthub://, gs://, s3://, file://)
-  - sync.branch is a valid git branch name
   - routing.mode is valid (auto, maintainer, contributor, explicit)
 
 Examples:
@@ -419,42 +388,23 @@ func validateSyncConfig(repoPath string) []string {
 	federationRemote := v.GetString("federation.remote")
 
 	// Validate sync.mode
-	validSyncModes := map[string]bool{
-		"":           true, // not set is valid (uses default)
-		"local":      true,
-		"git-branch": true,
-		"external":   true,
-	}
-	if syncMode != "" && !validSyncModes[syncMode] {
-		issues = append(issues, fmt.Sprintf("sync.mode: %q is invalid (valid values: local, git-branch, external)", syncMode))
+	if syncMode != "" && !config.IsValidSyncMode(syncMode) {
+		issues = append(issues, fmt.Sprintf("sync.mode: %q is invalid (valid values: %s)", syncMode, strings.Join(config.ValidSyncModes(), ", ")))
 	}
 
 	// Validate conflict.strategy
-	validConflictStrategies := map[string]bool{
-		"":       true, // not set is valid (uses default lww)
-		"lww":    true, // last-write-wins (default)
-		"manual": true, // require manual resolution
-		"ours":   true, // prefer local changes
-		"theirs": true, // prefer remote changes
-	}
-	if conflictStrategy != "" && !validConflictStrategies[conflictStrategy] {
-		issues = append(issues, fmt.Sprintf("conflict.strategy: %q is invalid (valid values: lww, manual, ours, theirs)", conflictStrategy))
+	if conflictStrategy != "" && !config.IsValidConflictStrategy(conflictStrategy) {
+		issues = append(issues, fmt.Sprintf("conflict.strategy: %q is invalid (valid values: %s)", conflictStrategy, strings.Join(config.ValidConflictStrategies(), ", ")))
 	}
 
 	// Validate federation.sovereignty
-	validSovereignties := map[string]bool{
-		"":          true, // not set is valid
-		"none":      true, // no sovereignty restrictions
-		"isolated":  true, // fully isolated, no federation
-		"federated": true, // participates in federation
-	}
-	if federationSov != "" && !validSovereignties[federationSov] {
-		issues = append(issues, fmt.Sprintf("federation.sovereignty: %q is invalid (valid values: none, isolated, federated)", federationSov))
+	if federationSov != "" && !config.IsValidSovereignty(federationSov) {
+		issues = append(issues, fmt.Sprintf("federation.sovereignty: %q is invalid (valid values: %s, or empty for no restriction)", federationSov, strings.Join(config.ValidSovereigntyTiers(), ", ")))
 	}
 
-	// Validate federation.remote when required
-	if syncMode == "external" && federationRemote == "" {
-		issues = append(issues, "federation.remote: required when sync.mode is 'external'")
+	// Validate federation.remote when required by sync mode
+	if (syncMode == string(config.SyncModeDoltNative) || syncMode == string(config.SyncModeBeltAndSuspenders)) && federationRemote == "" {
+		issues = append(issues, "federation.remote: required when sync.mode is 'dolt-native' or 'belt-and-suspenders'")
 	}
 
 	// Validate remote URL format

@@ -53,8 +53,7 @@ builds:
     main: ./cmd/bd
     binary: bd
     env:
-      - CGO_ENABLED=1
-      - CC=/tmp/zigcc/cc-aarch64-linux-android
+      - CGO_ENABLED=0
     tags:
       - gms_pure_go
     goos:
@@ -76,6 +75,7 @@ builds:
       - CC=/tmp/zigcc/cc-x86_64-macos
     tags:
       - gms_pure_go
+      - netgo
     goos:
       - darwin
     goarch:
@@ -95,6 +95,7 @@ builds:
       - CC=/tmp/zigcc/cc-aarch64-macos
     tags:
       - gms_pure_go
+      - netgo
     goos:
       - darwin
     goarch:
@@ -137,6 +138,7 @@ builds:
     env:
       - CGO_ENABLED=1
       - CC=/tmp/zigcc/cc-aarch64-windows-gnu
+
     tags:
       - gms_pure_go
     goos:
@@ -162,6 +164,7 @@ builds:
     env:
       - CGO_ENABLED=1
       - CC=/tmp/zigcc/cc-x86_64-freebsd
+
     tags:
       - gms_pure_go
     goos:

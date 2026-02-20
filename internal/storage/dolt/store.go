@@ -529,7 +529,6 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 	}
 
 	// Remove FK constraint on depends_on_id to allow external references.
-	// See SQLite migration 025_remove_depends_on_fk.go for design context.
 	// This is idempotent - DROP FOREIGN KEY fails silently if constraint doesn't exist.
 	_, err = db.ExecContext(ctx, "ALTER TABLE dependencies DROP FOREIGN KEY fk_dep_depends_on")
 	if err == nil {
@@ -864,6 +863,18 @@ type HistoryEntry struct {
 	CommitDate time.Time
 	// Issue data at that commit
 	IssueData map[string]interface{}
+}
+
+// HasRemote checks if a Dolt remote with the given name exists.
+func (s *DoltStore) HasRemote(ctx context.Context, name string) (bool, error) {
+	var count int
+	err := s.queryRowContext(ctx, func(row *sql.Row) error {
+		return row.Scan(&count)
+	}, "SELECT COUNT(*) FROM dolt_remotes WHERE name = ?", name)
+	if err != nil {
+		return false, fmt.Errorf("failed to check remote %s: %w", name, err)
+	}
+	return count > 0, nil
 }
 
 // AddRemote adds a Dolt remote

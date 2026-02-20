@@ -183,7 +183,7 @@ func TestYamlOnlyConfigWithoutDatabase(t *testing.T) {
 	}
 
 	// Test that IsYamlOnlyKey correctly identifies yaml-only keys
-	yamlOnlyKeys := []string{"no-db", "json", "sync.branch", "routing.mode"}
+	yamlOnlyKeys := []string{"no-db", "json", "routing.mode"}
 	for _, key := range yamlOnlyKeys {
 		if !config.IsYamlOnlyKey(key) {
 			t.Errorf("Expected %q to be a yaml-only key", key)
@@ -397,10 +397,10 @@ federation:
 		}
 	})
 
-	t.Run("external mode without remote", func(t *testing.T) {
+	t.Run("dolt-native mode without remote", func(t *testing.T) {
 		configContent := `prefix: test
 sync:
-  mode: "external"
+  mode: "dolt-native"
 `
 		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {
 			t.Fatalf("Failed to write config.yaml: %v", err)
@@ -444,11 +444,11 @@ federation:
 	t.Run("valid sync config", func(t *testing.T) {
 		configContent := `prefix: test
 sync:
-  mode: "git-branch"
+  mode: "dolt-native"
 conflict:
-  strategy: "lww"
+  strategy: "newest"
 federation:
-  sovereignty: "federated"
+  sovereignty: "T2"
   remote: "https://github.com/user/beads-data.git"
 `
 		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configContent), 0644); err != nil {

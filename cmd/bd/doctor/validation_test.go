@@ -4,26 +4,51 @@ package doctor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// setupDoltTestDir creates a beads dir with metadata.json pointing to dolt backend
-// and returns the dolt store path. Tests that use dolt.New() directly need this
-// so that the factory (used by doctor checks) can find the database.
-func setupDoltTestDir(t *testing.T, beadsDir string) string {
+// setupDoltTestDir creates a beads dir with metadata.json pointing to a unique
+// dolt database and returns (dolt store path, database name). Each test gets an
+// isolated database to prevent cross-test pollution. The caller should pass the
+// returned dbName to dolt.Config and call dropDoctorTestDatabase in cleanup.
+func setupDoltTestDir(t *testing.T, beadsDir string) (string, string) {
 	t.Helper()
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("Dolt not installed, skipping test")
+	}
+
+	// Generate unique database name for test isolation
+	h := sha256.Sum256([]byte(t.Name() + fmt.Sprintf("%d", time.Now().UnixNano())))
+	dbName := "doctest_" + hex.EncodeToString(h[:6])
+
+	port := doctorTestServerPort()
+
 	cfg := configfile.DefaultConfig()
 	cfg.Backend = configfile.BackendDolt
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltServerHost = "127.0.0.1"
+	cfg.DoltServerPort = port
+	cfg.DoltDatabase = dbName
 	if err := cfg.Save(beadsDir); err != nil {
 		t.Fatalf("Failed to save config: %v", err)
 	}
-	return filepath.Join(beadsDir, "dolt")
+
+	t.Cleanup(func() {
+		dropDoctorTestDatabase(dbName, port)
+	})
+
+	return filepath.Join(beadsDir, "dolt"), dbName
 }
 
 // TestCheckDuplicateIssues_ClosedIssuesExcluded verifies that closed issues
@@ -37,12 +62,12 @@ func TestCheckDuplicateIssues_ClosedIssuesExcluded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -86,12 +111,12 @@ func TestCheckDuplicateIssues_OpenDuplicatesDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -134,12 +159,12 @@ func TestCheckDuplicateIssues_DifferentDesignNotDuplicate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -181,12 +206,12 @@ func TestCheckDuplicateIssues_MixedOpenClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -235,12 +260,12 @@ func TestCheckDuplicateIssues_DeletedExcluded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -278,7 +303,16 @@ func TestCheckDuplicateIssues_NoDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// No database file created
+	// Write metadata.json pointing to a unique nonexistent database so that
+	// openStoreDB doesn't fall back to the shared default "beads" database.
+	h := sha256.Sum256([]byte(t.Name() + fmt.Sprintf("%d", time.Now().UnixNano())))
+	noDbName := "doctest_nodb_" + hex.EncodeToString(h[:6])
+	cfg := configfile.DefaultConfig()
+	cfg.Backend = configfile.BackendDolt
+	cfg.DoltDatabase = noDbName
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("Failed to save config: %v", err)
+	}
 
 	check := CheckDuplicateIssues(tmpDir, false, 1000)
 
@@ -309,12 +343,12 @@ func TestCheckDuplicateIssues_GastownUnderThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -360,44 +394,42 @@ func TestCheckDuplicateIssues_GastownOverThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
-	// Initialize database with prefix
 	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
 		t.Fatalf("Failed to set issue_prefix: %v", err)
 	}
 
-	// Create 1500 duplicate issues (over threshold, indicates a problem)
-	for i := 0; i < 1501; i++ {
-		issue := &types.Issue{
-			Title:       "Runaway wisps",
-			Description: "Too many wisps",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "test"); err != nil {
-			t.Fatalf("Failed to create issue: %v", err)
+	// Insert 51 duplicate issues (over threshold of 25) via raw SQL for speed.
+	// The original test used 1501 issues/threshold=1000, but that took ~9s of Dolt inserts.
+	// The threshold logic is the same regardless of scale.
+	db := store.UnderlyingDB()
+	for i := 0; i < 51; i++ {
+		_, err := db.ExecContext(ctx,
+			`INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, created_at, updated_at)
+			 VALUES (?, 'Runaway wisps', 'Too many wisps', '', '', '', 'open', 2, 'task', NOW(), NOW())`,
+			fmt.Sprintf("test-%06d", i))
+		if err != nil {
+			t.Fatalf("Failed to insert issue %d: %v", i, err)
 		}
 	}
 
 	store.Close()
 
-	check := CheckDuplicateIssues(tmpDir, true, 1000)
+	check := CheckDuplicateIssues(tmpDir, true, 25)
 
-	// With gastown mode and threshold=1000, 1500 duplicates should warn
 	if check.Status != StatusWarning {
 		t.Errorf("Status = %q, want %q (over gastown threshold)", check.Status, StatusWarning)
 	}
-	if check.Message != "1500 duplicate issue(s) in 1 group(s)" {
-		t.Errorf("Message = %q, want '1500 duplicate issue(s) in 1 group(s)'", check.Message)
+	if check.Message != "50 duplicate issue(s) in 1 group(s)" {
+		t.Errorf("Message = %q, want '50 duplicate issue(s) in 1 group(s)'", check.Message)
 	}
 }
 
@@ -409,12 +441,12 @@ func TestCheckDuplicateIssues_GastownCustomThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -423,30 +455,28 @@ func TestCheckDuplicateIssues_GastownCustomThreshold(t *testing.T) {
 		t.Fatalf("Failed to set issue_prefix: %v", err)
 	}
 
-	// Create 500 duplicate issues
-	for i := 0; i < 501; i++ {
-		issue := &types.Issue{
-			Title:       "Custom threshold test",
-			Description: "Test custom threshold",
-			Status:      types.StatusOpen,
-			Priority:    2,
-			IssueType:   types.TypeTask,
-		}
-		if err := store.CreateIssue(ctx, issue, "test"); err != nil {
-			t.Fatalf("Failed to create issue: %v", err)
+	// Insert 21 duplicate issues (over custom threshold of 10) via raw SQL for speed.
+	db := store.UnderlyingDB()
+	for i := 0; i < 21; i++ {
+		_, err := db.ExecContext(ctx,
+			`INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, created_at, updated_at)
+			 VALUES (?, 'Custom threshold test', 'Test custom threshold', '', '', '', 'open', 2, 'task', NOW(), NOW())`,
+			fmt.Sprintf("test-%06d", i))
+		if err != nil {
+			t.Fatalf("Failed to insert issue %d: %v", i, err)
 		}
 	}
 
 	store.Close()
 
-	// With custom threshold of 250, 500 duplicates should warn
-	check := CheckDuplicateIssues(tmpDir, true, 250)
+	// With custom threshold of 10, 20 duplicates should warn
+	check := CheckDuplicateIssues(tmpDir, true, 10)
 
 	if check.Status != StatusWarning {
-		t.Errorf("Status = %q, want %q (over custom threshold of 250)", check.Status, StatusWarning)
+		t.Errorf("Status = %q, want %q (over custom threshold of 10)", check.Status, StatusWarning)
 	}
-	if check.Message != "500 duplicate issue(s) in 1 group(s)" {
-		t.Errorf("Message = %q, want '500 duplicate issue(s) in 1 group(s)'", check.Message)
+	if check.Message != "20 duplicate issue(s) in 1 group(s)" {
+		t.Errorf("Message = %q, want '20 duplicate issue(s) in 1 group(s)'", check.Message)
 	}
 }
 
@@ -459,12 +489,12 @@ func TestCheckDuplicateIssues_NonGastownMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -510,12 +540,12 @@ func TestCheckDuplicateIssues_MultipleDuplicateGroups(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 
@@ -574,12 +604,12 @@ func TestCheckDuplicateIssues_ZeroDuplicatesNullHandling(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := setupDoltTestDir(t, beadsDir)
+	dbPath, dbName := setupDoltTestDir(t, beadsDir)
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath, Database: dbName})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
 

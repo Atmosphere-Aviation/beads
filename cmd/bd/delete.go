@@ -3,13 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -59,15 +60,13 @@ Force: Delete and orphan dependents
 		if fromFile != "" {
 			fileIDs, err := readIssueIDsFromFile(fromFile)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
-				os.Exit(1)
+				FatalError("reading file: %v", err)
 			}
 			issueIDs = append(issueIDs, fileIDs...)
 		}
 		if len(issueIDs) == 0 {
-			fmt.Fprintf(os.Stderr, "Error: no issue IDs provided\n")
 			_ = cmd.Usage()
-			os.Exit(1)
+			FatalError("no issue IDs provided")
 		}
 		// Remove duplicates
 		issueIDs = uniqueStrings(issueIDs)
@@ -75,8 +74,7 @@ Force: Delete and orphan dependents
 		// Direct mode - ensure store is available
 		if store == nil {
 			if err := ensureStoreActive(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 		}
 
@@ -93,20 +91,17 @@ Force: Delete and orphan dependents
 		// Get the issue to be deleted
 		issue, err := store.GetIssue(ctx, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		if issue == nil {
-			fmt.Fprintf(os.Stderr, "Error: issue %s not found\n", issueID)
-			os.Exit(1)
+			if errors.Is(err, storage.ErrNotFound) {
+				FatalError("issue %s not found", issueID)
+			}
+			FatalError("%v", err)
 		}
 		// Find all connected issues (dependencies in both directions)
 		connectedIssues := make(map[string]*types.Issue)
 		// Get dependencies (issues this one depends on)
 		deps, err := store.GetDependencies(ctx, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting dependencies: %v\n", err)
-			os.Exit(1)
+			FatalError("getting dependencies: %v", err)
 		}
 		for _, dep := range deps {
 			connectedIssues[dep.ID] = dep
@@ -114,8 +109,7 @@ Force: Delete and orphan dependents
 		// Get dependents (issues that depend on this one)
 		dependents, err := store.GetDependents(ctx, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting dependents: %v\n", err)
-			os.Exit(1)
+			FatalError("getting dependents: %v", err)
 		}
 		for _, dependent := range dependents {
 			connectedIssues[dependent.ID] = dependent
@@ -123,8 +117,7 @@ Force: Delete and orphan dependents
 		// Get dependency records (outgoing) to count how many we'll remove
 		depRecords, err := store.GetDependencyRecords(ctx, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting dependency records: %v\n", err)
-			os.Exit(1)
+			FatalError("getting dependency records: %v", err)
 		}
 		// Build the regex pattern for matching issue IDs (handles hyphenated IDs properly)
 		// Pattern: (^|non-word-char)(issueID)($|non-word-char) where word-char includes hyphen
@@ -168,67 +161,55 @@ Force: Delete and orphan dependents
 			fmt.Printf("To proceed, run: %s\n\n", ui.RenderWarn("bd delete "+issueID+" --force"))
 			return
 		}
-		// Actually delete
-		// 1. Update text references in connected issues (all text fields)
+		// Actually delete — all writes in a single transaction
 		updatedIssueCount := 0
-		for id, connIssue := range connectedIssues {
-			updates := make(map[string]interface{})
-			// Replace in description
-			if re.MatchString(connIssue.Description) {
-				newDesc := re.ReplaceAllString(connIssue.Description, replacementText)
-				updates["description"] = newDesc
-			}
-			// Replace in notes
-			if connIssue.Notes != "" && re.MatchString(connIssue.Notes) {
-				newNotes := re.ReplaceAllString(connIssue.Notes, replacementText)
-				updates["notes"] = newNotes
-			}
-			// Replace in design
-			if connIssue.Design != "" && re.MatchString(connIssue.Design) {
-				newDesign := re.ReplaceAllString(connIssue.Design, replacementText)
-				updates["design"] = newDesign
-			}
-			// Replace in acceptance_criteria
-			if connIssue.AcceptanceCriteria != "" && re.MatchString(connIssue.AcceptanceCriteria) {
-				newAC := re.ReplaceAllString(connIssue.AcceptanceCriteria, replacementText)
-				updates["acceptance_criteria"] = newAC
-			}
-			if len(updates) > 0 {
-				if err := store.UpdateIssue(ctx, id, updates, actor); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: Failed to update references in %s: %v\n", id, err)
-				} else {
+		totalDepsRemoved := 0
+		deleteErr := transact(ctx, store, fmt.Sprintf("bd: delete %s", issueID), func(tx storage.Transaction) error {
+			// 1. Update text references in connected issues
+			for id, connIssue := range connectedIssues {
+				updates := make(map[string]interface{})
+				if re.MatchString(connIssue.Description) {
+					updates["description"] = re.ReplaceAllString(connIssue.Description, replacementText)
+				}
+				if connIssue.Notes != "" && re.MatchString(connIssue.Notes) {
+					updates["notes"] = re.ReplaceAllString(connIssue.Notes, replacementText)
+				}
+				if connIssue.Design != "" && re.MatchString(connIssue.Design) {
+					updates["design"] = re.ReplaceAllString(connIssue.Design, replacementText)
+				}
+				if connIssue.AcceptanceCriteria != "" && re.MatchString(connIssue.AcceptanceCriteria) {
+					updates["acceptance_criteria"] = re.ReplaceAllString(connIssue.AcceptanceCriteria, replacementText)
+				}
+				if len(updates) > 0 {
+					if err := tx.UpdateIssue(ctx, id, updates, actor); err != nil {
+						return fmt.Errorf("update references in %s: %w", id, err)
+					}
 					updatedIssueCount++
 				}
 			}
-		}
-		// 2. Remove all dependency links (outgoing)
-		outgoingRemoved := 0
-		for _, dep := range depRecords {
-			if err := store.RemoveDependency(ctx, dep.IssueID, dep.DependsOnID, actor); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: Failed to remove dependency %s → %s: %v\n",
-					dep.IssueID, dep.DependsOnID, err)
-			} else {
-				outgoingRemoved++
+			// 2. Remove outgoing dependency links
+			for _, dep := range depRecords {
+				if err := tx.RemoveDependency(ctx, dep.IssueID, dep.DependsOnID, actor); err != nil {
+					return fmt.Errorf("remove dependency %s → %s: %w", dep.IssueID, dep.DependsOnID, err)
+				}
+				totalDepsRemoved++
 			}
-		}
-		// 3. Remove inbound dependency links (issues that depend on this one)
-		inboundRemoved := 0
-		for _, dep := range dependents {
-			if err := store.RemoveDependency(ctx, dep.ID, issueID, actor); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: Failed to remove dependency %s → %s: %v\n",
-					dep.ID, issueID, err)
-			} else {
-				inboundRemoved++
+			// 3. Remove inbound dependency links
+			for _, dep := range dependents {
+				if err := tx.RemoveDependency(ctx, dep.ID, issueID, actor); err != nil {
+					return fmt.Errorf("remove dependency %s → %s: %w", dep.ID, issueID, err)
+				}
+				totalDepsRemoved++
 			}
+			// 4. Delete the issue
+			if err := tx.DeleteIssue(ctx, issueID); err != nil {
+				return fmt.Errorf("delete %s: %w", issueID, err)
+			}
+			return nil
+		})
+		if deleteErr != nil {
+			FatalError("deleting issue: %v", deleteErr)
 		}
-		// 4. Delete the issue from the database
-		if err := deleteIssue(ctx, issueID); err != nil {
-			fmt.Fprintf(os.Stderr, "Error deleting issue: %v\n", err)
-			os.Exit(1)
-		}
-		// Remove the issue from the JSONL file as well
-		_ = removeIssueFromJSONL(issueID)
-		totalDepsRemoved := outgoingRemoved + inboundRemoved
 		if jsonOutput {
 			outputJSON(map[string]interface{}{
 				"deleted":              issueID,
@@ -248,72 +229,6 @@ func deleteIssue(ctx context.Context, issueID string) error {
 	return store.DeleteIssue(ctx, issueID)
 }
 
-// removeIssueFromJSONL removes a deleted issue from the JSONL file
-// Auto-flush cannot see deletions because the dirty_issues row is deleted with the issue
-func removeIssueFromJSONL(issueID string) error {
-	path := findJSONLPath()
-	if path == "" {
-		return nil // No JSONL file yet
-	}
-	// Read all issues except the deleted one
-	// #nosec G304 - controlled path from config
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // No file, nothing to clean
-		}
-		return fmt.Errorf("failed to open storage file: %w", err)
-	}
-	var issues []*types.Issue
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var iss types.Issue
-		if err := json.Unmarshal([]byte(line), &iss); err != nil {
-			// Skip malformed lines
-			continue
-		}
-		if iss.ID != issueID {
-			issues = append(issues, &iss)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("failed to read storage file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("failed to close storage file: %w", err)
-	}
-	// Write to temp file atomically
-	temp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
-	// #nosec G304 - controlled path from config
-	out, err := os.OpenFile(temp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	enc := json.NewEncoder(out)
-	for _, iss := range issues {
-		if err := enc.Encode(iss); err != nil {
-			_ = out.Close()
-			_ = os.Remove(temp)
-			return fmt.Errorf("failed to write issue: %w", err)
-		}
-	}
-	if err := out.Close(); err != nil {
-		_ = os.Remove(temp)
-		return fmt.Errorf("failed to close temp file: %w", err)
-	}
-	// Atomic rename
-	if err := os.Rename(temp, path); err != nil {
-		_ = os.Remove(temp)
-		return fmt.Errorf("failed to rename temp file: %w", err)
-	}
-	return nil
-}
-
 // deleteBatch handles deletion of multiple issues
 //
 //nolint:unparam // cmd parameter required for potential future use
@@ -321,8 +236,7 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 	// Ensure we have a direct store
 	if store == nil {
 		if err := ensureStoreActive(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 	}
 	ctx := rootCtx
@@ -332,18 +246,17 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 	for _, id := range issueIDs {
 		issue, err := store.GetIssue(ctx, id)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting issue %s: %v\n", id, err)
-			os.Exit(1)
-		}
-		if issue == nil {
-			notFound = append(notFound, id)
+			if errors.Is(err, storage.ErrNotFound) {
+				notFound = append(notFound, id)
+			} else {
+				FatalError("getting issue %s: %v", id, err)
+			}
 		} else {
 			issues[id] = issue
 		}
 	}
 	if len(notFound) > 0 {
-		fmt.Fprintf(os.Stderr, "Error: issues not found: %s\n", strings.Join(notFound, ", "))
-		os.Exit(1)
+		FatalError("issues not found: %s", strings.Join(notFound, ", "))
 	}
 	// Dry-run or preview mode
 	if dryRun || !force {
@@ -403,8 +316,7 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 	// Actually delete
 	result, err := store.DeleteIssues(ctx, issueIDs, cascade, force, false)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// Update text references in connected issues (using pre-collected issues)
@@ -440,8 +352,7 @@ func deleteBatchFallback(issueIDs []string, force bool, dryRun bool, cascade boo
 
 	// Cascade not supported in fallback mode
 	if cascade {
-		fmt.Fprintf(os.Stderr, "Error: --cascade not supported in --no-db mode\n")
-		os.Exit(1)
+		FatalError("--cascade not supported in --no-db mode")
 	}
 
 	// Verify all issues exist first
@@ -450,18 +361,17 @@ func deleteBatchFallback(issueIDs []string, force bool, dryRun bool, cascade boo
 	for _, id := range issueIDs {
 		issue, err := store.GetIssue(ctx, id)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting issue %s: %v\n", id, err)
-			os.Exit(1)
-		}
-		if issue == nil {
-			notFound = append(notFound, id)
+			if errors.Is(err, storage.ErrNotFound) {
+				notFound = append(notFound, id)
+			} else {
+				FatalError("getting issue %s: %v", id, err)
+			}
 		} else {
 			issues[id] = issue
 		}
 	}
 	if len(notFound) > 0 {
-		fmt.Fprintf(os.Stderr, "Error: issues not found: %s\n", strings.Join(notFound, ", "))
-		os.Exit(1)
+		FatalError("issues not found: %s", strings.Join(notFound, ", "))
 	}
 
 	// Preview mode
@@ -539,7 +449,6 @@ func deleteBatchFallback(issueIDs []string, force bool, dryRun bool, cascade boo
 			fmt.Fprintf(os.Stderr, "Error deleting issue %s: %v\n", issueID, err)
 			continue
 		}
-		_ = removeIssueFromJSONL(issueID)
 		deletedCount++
 	}
 

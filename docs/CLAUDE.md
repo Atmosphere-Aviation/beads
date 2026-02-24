@@ -24,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 3. **CLI Layer** (`cmd/bd/`)
    - Cobra-based commands (one file per command: `create.go`, `list.go`, etc.)
-   - Direct database access (Dolt embedded or server mode)
+   - Direct database access (Dolt server mode)
    - All commands support `--json` for programmatic use
    - Main entry point in `main.go`
 
@@ -35,15 +35,13 @@ Beads uses **Dolt** as its storage backend — a version-controlled SQL database
 ```
 Dolt DB (.beads/dolt/)
     ↕ Dolt commits (automatic per write)
-    ↕ JSONL export (git hooks, for portability)
-JSONL (.beads/issues.jsonl, git-tracked)
-    ↕ git push/pull
-Remote (shared across machines)
+    ↕ Dolt push/pull (native sync)
+Remote (Dolt remotes: DoltHub, S3, GCS, etc.)
 ```
 
 - **Write path**: CLI → Dolt → auto-commit to Dolt history
 - **Read path**: Direct SQL queries against Dolt
-- **Sync**: JSONL maintained via git hooks for portability; Dolt handles versioning natively
+- **Sync**: Dolt handles versioning and sync natively; `bd import`/`bd export` available for migration
 - **Hash-based IDs**: Automatic collision prevention (v0.20+)
 
 Core implementation:
@@ -84,15 +82,15 @@ golangci-lint run ./...
 ## Testing Philosophy
 
 - Unit tests live next to implementation (`*_test.go`)
-- Integration tests use real Dolt databases (via embedded server in temp dirs)
+- Integration tests use real Dolt databases (via server in temp dirs)
 - Script-based tests in `cmd/bd/testdata/*.txt` (see `scripttest_test.go`)
 - RPC layer has extensive isolation and edge case coverage
 
 ## Important Notes
 
 - **Always read AGENTS.md first** - it has the complete workflow
-- Install git hooks for JSONL sync: `bd hooks install`
-- Run `bd sync` at end of agent sessions to sync with remote
+- Install git hooks: `bd hooks install`
+- Use `bd dolt push` / `bd dolt pull` for remote sync
 - Check for duplicates proactively: `bd duplicates --auto-merge`
 - Use `--json` flags for all programmatic use
 

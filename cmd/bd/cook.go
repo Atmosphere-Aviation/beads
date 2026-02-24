@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -359,24 +358,21 @@ func runCook(cmd *cobra.Command, args []string) {
 	// Parse and validate flags
 	flags, err := parseCookFlags(cmd, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// Validate store access for persist mode
 	if flags.persist {
 		CheckReadonly("cook --persist")
 		if store == nil {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
+			FatalError("no database connection")
 		}
 	}
 
 	// Load and resolve the formula
 	resolved, err := loadAndResolveFormula(flags.formulaPath, flags.searchPaths)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// Apply prefix to proto ID if specified
@@ -403,16 +399,14 @@ func runCook(cmd *cobra.Command, args []string) {
 	// Handle ephemeral mode (default)
 	if !flags.persist {
 		if err := outputCookEphemeral(resolved, flags.runtimeMode, flags.inputVars, vars); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		return
 	}
 
 	// Handle persist mode
 	if err := persistCookFormula(rootCtx, resolved, protoID, flags.force, vars, bondPoints); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 }
 
@@ -742,6 +736,27 @@ func resolveAndCookFormulaWithVars(formulaName string, searchPaths []string, con
 		resolved.Steps = filteredSteps
 	}
 
+	// Handle standalone expansion formulas (bd-qzb).
+	// Expansion formulas store content in Template, not Steps. Materialize
+	// the template into Steps using a synthetic "main" target so the normal
+	// cooking pipeline can process them.
+	if resolved.Type == formula.TypeExpansion && len(resolved.Template) > 0 {
+		expansionVars := make(map[string]string)
+		for name, def := range resolved.Vars {
+			if def != nil && def.Default != nil {
+				expansionVars[name] = *def.Default
+			}
+		}
+		if conditionVars != nil {
+			for k, v := range conditionVars {
+				expansionVars[k] = v
+			}
+		}
+		if err := formula.MaterializeExpansion(resolved, "main", expansionVars); err != nil {
+			return nil, fmt.Errorf("standalone expansion %q: %w", formulaName, err)
+		}
+	}
+
 	// Cook to in-memory subgraph, including variable definitions for default handling
 	return cookFormulaToSubgraphWithVars(resolved, resolved.Formula, resolved.Vars)
 }
@@ -822,20 +837,14 @@ func cookFormula(ctx context.Context, s *dolt.DoltStore, f *formula.Formula, pro
 		collectDependencies(step, idMapping, &deps)
 	}
 
-	// Create all issues using batch with skip prefix validation
-	opts := storage.BatchCreateOptions{
-		SkipPrefixValidation: true, // Molecules use mol-* prefix
-		OrphanHandling:       storage.OrphanAllow,
-	}
-	if err := s.CreateIssuesWithFullOptions(ctx, issues, actor, opts); err != nil {
-		return nil, fmt.Errorf("failed to create issues: %w", err)
-	}
+	// Create issues, labels, and dependencies in a single atomic transaction.
+	// This prevents orphaned issues if label/dependency creation fails.
+	err := transact(ctx, s, fmt.Sprintf("bd: cook formula %s", protoID), func(tx storage.Transaction) error {
+		// Create all issues
+		if err := tx.CreateIssues(ctx, issues, actor); err != nil {
+			return fmt.Errorf("failed to create issues: %w", err)
+		}
 
-	// Track if we need cleanup on failure
-	issuesCreated := true
-
-	// Add labels and dependencies in a transaction
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
 		// Add labels
 		for _, l := range labels {
 			if err := tx.AddLabel(ctx, l.issueID, l.label, actor); err != nil {
@@ -854,18 +863,6 @@ func cookFormula(ctx context.Context, s *dolt.DoltStore, f *formula.Formula, pro
 	})
 
 	if err != nil {
-		// Clean up: delete the issues we created since labels/deps failed
-		if issuesCreated {
-			cleanupErr := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
-				for i := len(issues) - 1; i >= 0; i-- {
-					_ = tx.DeleteIssue(ctx, issues[i].ID) // Best effort cleanup
-				}
-				return nil
-			})
-			if cleanupErr != nil {
-				return nil, fmt.Errorf("%w (cleanup also failed: %v)", err, cleanupErr)
-			}
-		}
 		return nil, err
 	}
 
@@ -953,7 +950,7 @@ func deleteProtoSubgraph(ctx context.Context, s *dolt.DoltStore, protoID string)
 	}
 
 	// Delete in reverse order (children first)
-	return s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+	return transact(ctx, s, fmt.Sprintf("bd: delete proto subgraph %s", protoID), func(tx storage.Transaction) error {
 		for i := len(subgraph.Issues) - 1; i >= 0; i-- {
 			issue := subgraph.Issues[i]
 			if err := tx.DeleteIssue(ctx, issue.ID); err != nil {

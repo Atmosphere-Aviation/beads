@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -103,13 +104,20 @@ func formatIssueLong(buf *strings.Builder, issue *types.Issue, labels []string) 
 	if len(labels) > 0 {
 		buf.WriteString(fmt.Sprintf("  Labels: %v\n", labels))
 	}
+	if hasCustomMetadata(issue) {
+		if n := countMetadataKeys(issue); n > 0 {
+			buf.WriteString(fmt.Sprintf("  Metadata: %d keys\n", n))
+		} else {
+			buf.WriteString("  Metadata: set\n")
+		}
+	}
 	buf.WriteString("\n")
 }
 
 // formatAgentIssue formats a single issue in ultra-compact agent mode format
-// Output: "ID: Title" with optional dependency info "(blocked by: X, blocks: Y)"
-func formatAgentIssue(buf *strings.Builder, issue *types.Issue, blockedBy, blocks []string) {
-	depInfo := formatDependencyInfo(blockedBy, blocks)
+// Output: "ID: Title" with optional dependency info "(parent: X, blocked by: Y, blocks: Z)"
+func formatAgentIssue(buf *strings.Builder, issue *types.Issue, blockedBy, blocks []string, parent string) {
+	depInfo := formatDependencyInfo(blockedBy, blocks, parent)
 	if depInfo != "" {
 		buf.WriteString(fmt.Sprintf("%s: %s %s\n", issue.ID, issue.Title, depInfo))
 	} else {
@@ -117,14 +125,18 @@ func formatAgentIssue(buf *strings.Builder, issue *types.Issue, blockedBy, block
 	}
 }
 
-// formatDependencyInfo formats blocking dependency info for list output
-// Returns "(blocked by: X, Y, blocks: Z)" or "" if no blocking dependencies
-func formatDependencyInfo(blockedBy, blocks []string) string {
-	if len(blockedBy) == 0 && len(blocks) == 0 {
+// formatDependencyInfo formats dependency info for list output.
+// Parent-child deps are shown as "parent: X" (structural), separate from "blocked by" (blocking). (bd-hcxu)
+// Returns "(parent: X, blocked by: Y, blocks: Z)" or "" if no dependencies.
+func formatDependencyInfo(blockedBy, blocks []string, parent string) string {
+	if len(blockedBy) == 0 && len(blocks) == 0 && parent == "" {
 		return ""
 	}
 
 	var parts []string
+	if parent != "" {
+		parts = append(parts, fmt.Sprintf("parent: %s", parent))
+	}
 	if len(blockedBy) > 0 {
 		parts = append(parts, fmt.Sprintf("blocked by: %s", strings.Join(blockedBy, ", ")))
 	}
@@ -173,8 +185,8 @@ func buildBlockingMaps(allDeps map[string][]*types.Dependency, closedIDs map[str
 }
 
 // getClosedBlockerIDs collects all unique blocker IDs from dependency records
-// and returns the subset that are closed. This is used to filter stale "blocked by"
-// annotations in bd list output.
+// and returns the subset that are closed or unreachable. This is used to filter
+// stale "blocked by" annotations in bd list output.
 func getClosedBlockerIDs(ctx context.Context, s *dolt.DoltStore, allDeps map[string][]*types.Dependency) map[string]bool {
 	// Collect unique blocker IDs
 	blockerIDs := make(map[string]bool)
@@ -190,6 +202,10 @@ func getClosedBlockerIDs(ctx context.Context, s *dolt.DoltStore, allDeps map[str
 	for id := range blockerIDs {
 		issue, err := s.GetIssue(ctx, id)
 		if err != nil || issue == nil {
+			// Treat missing or unreachable blockers as resolved — a blocker
+			// that cannot be fetched cannot block work, matching the behavior
+			// of computeBlockedIDs which only considers active issues.
+			closedIDs[id] = true
 			continue
 		}
 		if issue.Status == types.StatusClosed {
@@ -201,8 +217,8 @@ func getClosedBlockerIDs(ctx context.Context, s *dolt.DoltStore, allDeps map[str
 
 // formatIssueCompact formats a single issue in compact format to a buffer
 // Uses status icons for better scanability - consistent with bd graph
-// Format: [icon] [pin] ID [Priority] [Type] @assignee [labels] - Title (blocked by: X, blocks: Y)
-func formatIssueCompact(buf *strings.Builder, issue *types.Issue, labels []string, blockedBy, blocks []string) {
+// Format: [icon] [pin] ID [Priority] [Type] @assignee [labels] - Title (parent: X, blocked by: Y, blocks: Z)
+func formatIssueCompact(buf *strings.Builder, issue *types.Issue, labels []string, blockedBy, blocks []string, parent string) {
 	labelsStr := ""
 	if len(labels) > 0 {
 		labelsStr = fmt.Sprintf(" %v", labels)
@@ -213,7 +229,7 @@ func formatIssueCompact(buf *strings.Builder, issue *types.Issue, labels []strin
 	}
 
 	// Format dependency info
-	depInfo := formatDependencyInfo(blockedBy, blocks)
+	depInfo := formatDependencyInfo(blockedBy, blocks, parent)
 	if depInfo != "" {
 		depInfo = " " + depInfo
 	}
@@ -238,4 +254,22 @@ func formatIssueCompact(buf *strings.Builder, issue *types.Issue, labels []strin
 			ui.RenderType(string(issue.IssueType)),
 			assigneeStr, labelsStr, issue.Title, depInfo))
 	}
+}
+
+// hasCustomMetadata returns true if the issue has non-empty custom metadata.
+func hasCustomMetadata(issue *types.Issue) bool {
+	if len(issue.Metadata) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(string(issue.Metadata))
+	return trimmed != "{}" && trimmed != "null"
+}
+
+// countMetadataKeys returns the number of top-level keys in the issue's metadata JSON.
+func countMetadataKeys(issue *types.Issue) int {
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(issue.Metadata, &data); err != nil {
+		return 0
+	}
+	return len(data)
 }

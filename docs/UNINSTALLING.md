@@ -7,13 +7,14 @@ This guide explains how to completely remove Beads from a repository.
 Run these commands from your repository root:
 
 ```bash
-# 1. Stop any running daemon
-bd daemons killall
+# 1. Stop any running Dolt server (optional)
+bd dolt stop 2>/dev/null || true
 
 # 2. Remove git hooks installed by Beads
-rm -f .git/hooks/pre-commit .git/hooks/post-merge .git/hooks/pre-push .git/hooks/post-checkout
+rm -f .git/hooks/pre-commit .git/hooks/prepare-commit-msg .git/hooks/post-merge .git/hooks/pre-push .git/hooks/post-checkout
 
-# 3. Remove merge driver config
+# 3. Remove git config entries
+git config --unset beads.role
 git config --unset merge.beads.driver
 git config --unset merge.beads.name
 
@@ -30,13 +31,12 @@ rm -rf .git/beads-worktrees
 
 ## Detailed Steps
 
-### 1. Stop the Daemon
+### 1. Stop the Dolt Server (Optional)
 
-If a Beads daemon is running for this repository, stop it first:
+If a Dolt server is running, stop it before cleanup:
 
 ```bash
-bd daemons list     # Check if daemon is running
-bd daemons killall  # Stop all daemons
+bd dolt stop 2>/dev/null || true
 ```
 
 ### 2. Remove Git Hooks
@@ -45,7 +45,8 @@ Beads installs these hooks in `.git/hooks/`:
 
 | Hook | Purpose |
 |------|---------|
-| `pre-commit` | Syncs JSONL before commits |
+| `pre-commit` | Runs beads pre-commit checks |
+| `prepare-commit-msg` | Adds beads metadata to commit messages |
 | `post-merge` | Imports changes after merges |
 | `pre-push` | Syncs before pushing |
 | `post-checkout` | Imports after branch switches |
@@ -54,6 +55,7 @@ To remove them:
 
 ```bash
 rm -f .git/hooks/pre-commit
+rm -f .git/hooks/prepare-commit-msg
 rm -f .git/hooks/post-merge
 rm -f .git/hooks/pre-push
 rm -f .git/hooks/post-checkout
@@ -69,31 +71,28 @@ Restore any backups if needed:
 mv .git/hooks/pre-commit.backup .git/hooks/pre-commit
 ```
 
-### 3. Remove Merge Driver Configuration
+### 3. Remove Git Config Entries
 
-Beads configures a custom merge driver in your git config:
+Beads adds these entries to your git config:
 
 ```bash
+git config --unset beads.role
 git config --unset merge.beads.driver
 git config --unset merge.beads.name
 ```
 
 ### 4. Remove .gitattributes Entry
 
-Beads adds a line to `.gitattributes` for JSONL merge handling:
+Beads may have added a line to `.gitattributes` for merge handling. Check and remove if present:
 
-```
-.beads/issues.jsonl merge=beads
-```
-
-Either remove the entire file (if it only contains this line):
 ```bash
+# Check if .gitattributes contains beads config
+cat .gitattributes
+
+# Remove the entire file if it only contains beads config
 rm -f .gitattributes
-```
 
-Or edit it to remove just the beads line:
-```bash
-# Edit .gitattributes and remove the line containing "merge=beads"
+# Or edit to remove just the beads line
 ```
 
 ### 5. Remove .beads Directory
@@ -102,15 +101,13 @@ The `.beads/` directory contains:
 
 | File/Dir | Description |
 |----------|-------------|
-| `beads.db` | SQLite database with issues |
-| `issues.jsonl` | Git-tracked issue data |
-| `daemon.pid` | Running daemon PID |
-| `daemon.log` | Daemon logs |
-| `daemon.lock` | Lock file for daemon |
-| `bd.sock` | Unix socket for daemon IPC |
+| `dolt/` | Dolt database directory |
+| `dolt/sql-server.pid` | Running Dolt server PID (if server mode) |
+| `dolt/sql-server.log` | Dolt server logs (if server mode) |
+| `issues.jsonl` | Legacy issue data (if present) |
 | `config.yaml` | Project configuration |
 | `metadata.json` | Version tracking |
-| `deletions.jsonl` | Soft-deleted issues |
+| `deletions.jsonl` | Soft-deleted issues (if present) |
 | `README.md` | Human-readable overview |
 
 Remove everything:
@@ -120,7 +117,7 @@ rm -rf .beads
 
 **Warning:** This permanently deletes all issue data. Consider backing up first:
 ```bash
-cp .beads/issues.jsonl ~/beads-backup-$(date +%Y%m%d).jsonl
+bd export -o ~/beads-backup-$(date +%Y%m%d).jsonl
 ```
 
 ### 6. Remove Sync Worktree

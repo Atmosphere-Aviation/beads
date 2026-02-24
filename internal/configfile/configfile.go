@@ -12,9 +12,8 @@ import (
 const ConfigFileName = "metadata.json"
 
 type Config struct {
-	Database    string `json:"database"`
-	JSONLExport string `json:"jsonl_export,omitempty"`
-	Backend     string `json:"backend,omitempty"` // always "dolt"
+	Database string `json:"database"`
+	Backend  string `json:"backend,omitempty"` // always "dolt"
 
 	// Deletions configuration
 	DeletionsRetentionDays int `json:"deletions_retention_days,omitempty"` // 0 means use default (3 days)
@@ -43,8 +42,7 @@ type Config struct {
 
 func DefaultConfig() *Config {
 	return &Config{
-		Database:    "beads.db",
-		JSONLExport: "issues.jsonl", // Canonical name (bd-6xd)
+		Database: "beads.db",
 	}
 }
 
@@ -120,13 +118,6 @@ func (c *Config) DatabasePath(beadsDir string) string {
 	return filepath.Join(beadsDir, "dolt")
 }
 
-func (c *Config) JSONLPath(beadsDir string) string {
-	if c.JSONLExport == "" {
-		return filepath.Join(beadsDir, "issues.jsonl")
-	}
-	return filepath.Join(beadsDir, c.JSONLExport)
-}
-
 // DefaultDeletionsRetentionDays is the default retention period for deletion records.
 const DefaultDeletionsRetentionDays = 3
 
@@ -157,27 +148,25 @@ const (
 // This is intentionally small and stable: callers should use these flags to decide
 // whether to enable features like RPC and process spawning.
 //
-// NOTE: The embedded Dolt driver is effectively single-writer at the OS-process level.
-// Even if multiple goroutines are safe within one process, multiple processes opening
-// the same Dolt directory concurrently can cause lock contention and transient
-// "read-only" failures. Therefore, Dolt is treated as single-process-only.
+// NOTE: Multiple processes opening the same Dolt directory concurrently can
+// cause lock contention and transient failures. Dolt is treated as
+// single-process-only unless using server mode.
 type BackendCapabilities struct {
 	// SingleProcessOnly indicates the backend must not be accessed from multiple
-	// Beads OS processes concurrently (embedded mode is single-writer).
+	// Beads OS processes concurrently.
 	SingleProcessOnly bool
 }
 
 // CapabilitiesForBackend returns capabilities for a backend string.
 // Unknown backends are treated conservatively as single-process-only.
 //
-// Note: For Dolt, this returns SingleProcessOnly=true for embedded mode.
+// Note: For Dolt, this returns SingleProcessOnly=true by default.
 // Use Config.GetCapabilities() when you have the full config to properly
 // handle server mode (which supports multi-process access).
 func CapabilitiesForBackend(backend string) BackendCapabilities {
 	switch strings.TrimSpace(strings.ToLower(backend)) {
 	case "", BackendDolt:
-		// Embedded Dolt is single-process-only.
-		// Server mode is handled by Config.GetCapabilities().
+		// Default to single-process-only; server mode overrides via Config.GetCapabilities().
 		return BackendCapabilities{SingleProcessOnly: true}
 	default:
 		return BackendCapabilities{SingleProcessOnly: true}
@@ -216,7 +205,7 @@ const (
 )
 
 // IsDoltServerMode returns true if Dolt should connect via sql-server.
-// Server mode is opt-in for high-concurrency scenarios; embedded is the default.
+// Server mode is the standard connection method.
 // Checks the BEADS_DOLT_SERVER_MODE env var first, then falls back to the
 // dolt_mode field in metadata.json. Only applies when backend is "dolt".
 func (c *Config) IsDoltServerMode() bool {
@@ -226,7 +215,7 @@ func (c *Config) IsDoltServerMode() bool {
 	return c.GetBackend() == BackendDolt && strings.ToLower(c.DoltMode) == DoltModeServer
 }
 
-// GetDoltMode returns the Dolt connection mode, defaulting to embedded.
+// GetDoltMode returns the Dolt connection mode, defaulting to server.
 func (c *Config) GetDoltMode() string {
 	if c.DoltMode == "" {
 		return DoltModeEmbedded

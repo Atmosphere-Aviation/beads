@@ -38,8 +38,13 @@ Examples:
 		if untilStr != "" {
 			t, err := timeparsing.ParseRelativeTime(untilStr, time.Now())
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid --until format %q. Examples: +1h, tomorrow, next monday, 2025-01-15\n", untilStr)
-				os.Exit(1)
+				FatalError("invalid --until format %q. Examples: +1h, tomorrow, next monday, 2025-01-15", untilStr)
+			}
+			// Warn if defer date is in the past (user probably meant future)
+			if t.Before(time.Now()) && !jsonOutput {
+				fmt.Fprintf(os.Stderr, "%s Defer date %q is in the past. Issue will appear in bd ready immediately.\n",
+					ui.RenderWarn("!"), t.Format("2006-01-02 15:04"))
+				fmt.Fprintf(os.Stderr, "  Did you mean a future date? Use --until=+1h or --until=tomorrow\n")
 			}
 			deferUntil = &t
 		}
@@ -49,8 +54,7 @@ Examples:
 		// Resolve partial IDs
 		_, err := utils.ResolvePartialIDs(ctx, store, args)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 
 		deferredIssues := []*types.Issue{}
@@ -58,7 +62,7 @@ Examples:
 		// Direct storage access
 		if store == nil {
 			FatalErrorWithHint("database not initialized",
-				"run 'bd init' to create a database, or use 'bd --no-db' for JSONL-only mode")
+				"run 'bd init' to create a database")
 		}
 
 		for _, id := range args {

@@ -10,12 +10,17 @@ import (
 	"strings"
 	"unicode"
 
+	"time"
+
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/telemetry"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 var findDuplicatesCmd = &cobra.Command{
@@ -83,15 +88,13 @@ func runFindDuplicates(cmd *cobra.Command, _ []string) {
 
 	// Validate method
 	if method != "mechanical" && method != "ai" {
-		fmt.Fprintf(os.Stderr, "Error: invalid method %q (use: mechanical, ai)\n", method)
-		os.Exit(1)
+		FatalError("invalid method %q (use: mechanical, ai)", method)
 	}
 
 	// AI method requires API key
 	if method == "ai" {
 		if os.Getenv("ANTHROPIC_API_KEY") == "" {
-			fmt.Fprintf(os.Stderr, "Error: --method ai requires ANTHROPIC_API_KEY environment variable\n")
-			os.Exit(1)
+			FatalError("--method ai requires ANTHROPIC_API_KEY environment variable")
 		}
 	}
 
@@ -107,8 +110,7 @@ func runFindDuplicates(cmd *cobra.Command, _ []string) {
 
 	issues, err = store.SearchIssues(ctx, "", filter)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error fetching issues: %v\n", err)
-		os.Exit(1)
+		FatalError("fetching issues: %v", err)
 	}
 
 	// Default: filter out closed issues unless status flag is set
@@ -423,7 +425,15 @@ func analyzeWithAI(ctx context.Context, client anthropic.Client, model anthropic
 		sb.WriteString("\n")
 	}
 
-	message, err := client.Messages.New(ctx, anthropic.MessageNewParams{
+	tracer := telemetry.Tracer("github.com/steveyegge/beads/ai")
+	aiCtx, aiSpan := tracer.Start(ctx, "anthropic.messages.new")
+	aiSpan.SetAttributes(
+		attribute.String("bd.ai.model", string(model)),
+		attribute.String("bd.ai.operation", "find_duplicates"),
+		attribute.Int("bd.ai.batch_size", len(candidates)),
+	)
+	t0 := time.Now()
+	message, err := client.Messages.New(aiCtx, anthropic.MessageNewParams{
 		Model:     model,
 		MaxTokens: 2048,
 		Messages: []anthropic.MessageParam{
@@ -431,10 +441,19 @@ func analyzeWithAI(ctx context.Context, client anthropic.Client, model anthropic
 		},
 	})
 	if err != nil {
+		aiSpan.RecordError(err)
+		aiSpan.SetStatus(codes.Error, err.Error())
+		aiSpan.End()
 		fmt.Fprintf(os.Stderr, "Warning: AI analysis failed: %v\n", err)
 		// Fall back to mechanical scores
 		return candidates
 	}
+	aiSpan.SetAttributes(
+		attribute.Int64("bd.ai.input_tokens", message.Usage.InputTokens),
+		attribute.Int64("bd.ai.output_tokens", message.Usage.OutputTokens),
+		attribute.Float64("bd.ai.duration_ms", float64(time.Since(t0).Milliseconds())),
+	)
+	aiSpan.End()
 
 	if len(message.Content) == 0 || message.Content[0].Type != "text" {
 		fmt.Fprintf(os.Stderr, "Warning: unexpected AI response format\n")

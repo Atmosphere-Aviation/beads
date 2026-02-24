@@ -37,13 +37,13 @@ The wizard will:
 - Import existing issues from git (if any)
 - Prompt to install git hooks (recommended)
 - Prompt to configure git merge driver (recommended)
-- Auto-start daemon for sync (SQLite backend only)
+- Auto-start Dolt server for database operations
 
 Notes:
 - SQLite backend stores data in `.beads/beads.db`.
 - Dolt backend stores data in `.beads/dolt/` and records `"database": "dolt"` in `.beads/metadata.json`.
-- Dolt backend runs **single-process-only**; daemon mode is disabled.
-- Dolt backend **auto-commits** after each successful write command in embedded mode (`dolt.auto-commit: on`). In server mode, auto-commit defaults to OFF. Override with `bd --dolt-auto-commit off|on ...` or config.
+- Dolt backend uses a `dolt sql-server` for database operations.
+- Dolt backend auto-commit defaults to OFF. Override with `bd --dolt-auto-commit off|on ...` or config.
 
 ### Role Configuration
 
@@ -229,10 +229,10 @@ As your project accumulates closed issues, the database grows. Manage size with 
 bd admin compact --stats
 
 # Preview compaction candidates (30+ days closed)
-bd admin compact --analyze --json --no-daemon
+bd admin compact --analyze --json
 
 # Apply agent-generated summary
-bd admin compact --apply --id bd-42 --summary summary.txt --no-daemon
+bd admin compact --apply --id bd-42 --summary summary.txt
 
 # Immediately delete closed issues (CAUTION: permanent!)
 bd admin cleanup --force

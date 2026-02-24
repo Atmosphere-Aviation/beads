@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -17,7 +18,7 @@ import (
 //
 // Wisps are ephemeral issues with Ephemeral=true in the main database.
 // They're used for patrol cycles and operational loops that shouldn't
-// be exported to JSONL (and thus not synced via git).
+// be synced via git.
 //
 // Commands:
 //   bd mol wisp list    - List all wisps in current context
@@ -32,7 +33,7 @@ When called with a proto-id argument, creates a wisp from that proto.
 When called with a subcommand (list, gc), manages existing wisps.
 
 Wisps are issues with Ephemeral=true in the main database. They're stored
-locally but NOT exported to JSONL (and thus not synced via git).
+locally but NOT synced via git.
 
 WHEN TO USE WISP vs POUR:
   wisp (vapor): Ephemeral work that auto-cleans up
@@ -108,7 +109,7 @@ var wispCreateCmd = &cobra.Command{
 	Long: `Create a wisp from a proto - sublimation from solid to vapor.
 
 This is the chemistry-inspired command for creating ephemeral work from templates.
-The resulting wisp is stored in the main database with Ephemeral=true and NOT exported to JSONL.
+The resulting wisp is stored in the main database with Ephemeral=true and NOT synced via git.
 
 Phase transition: Proto (solid) -> Wisp (vapor)
 
@@ -120,7 +121,7 @@ Use wisp for:
 
 The wisp will:
   - Be stored in main database with Ephemeral=true flag
-  - NOT be exported to JSONL (and thus not synced via git)
+  - NOT be synced via git
   - Either evaporate (burn) or condense to digest (squash)
 
 Examples:
@@ -138,9 +139,7 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 
 	// Wisp create requires direct store access (daemon auto-bypassed for wisp ops)
 	if store == nil {
-		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		fmt.Fprintf(os.Stderr, "Hint: run 'bd init' or 'bd import' to initialize the database\n")
-		os.Exit(1)
+		FatalErrorWithHint("no database connection", "run 'bd init' or 'bd import' to initialize the database")
 	}
 
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
@@ -151,8 +150,7 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 	for _, v := range varFlags {
 		parts := strings.SplitN(v, "=", 2)
 		if len(parts) != 2 {
-			fmt.Fprintf(os.Stderr, "Error: invalid variable format '%s', expected 'key=value'\n", v)
-			os.Exit(1)
+			FatalError("invalid variable format '%s', expected 'key=value'", v)
 		}
 		vars[parts[0]] = parts[1]
 	}
@@ -189,8 +187,7 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 				Labels: []string{MoleculeLabel},
 			})
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error searching for proto: %v\n", err)
-				os.Exit(1)
+				FatalError("searching for proto: %v", err)
 			}
 			found := false
 			for _, issue := range issues {
@@ -201,33 +198,27 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 				}
 			}
 			if !found {
-				fmt.Fprintf(os.Stderr, "Error: '%s' not found as formula or proto\n", args[0])
-				fmt.Fprintf(os.Stderr, "Hint: run 'bd formula list' to see available formulas\n")
-				os.Exit(1)
+				FatalErrorWithHint(fmt.Sprintf("'%s' not found as formula or proto", args[0]), "run 'bd formula list' to see available formulas")
 			}
 		}
 
 		// Load the proto
-		// Note: GetIssue returns (nil, nil) for not-found, so check both
 		protoIssue, err := store.GetIssue(ctx, protoID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading proto %s: %v\n", protoID, err)
-			os.Exit(1)
-		}
-		if protoIssue == nil {
-			fmt.Fprintf(os.Stderr, "Error: proto not found: %s\n", protoID)
-			os.Exit(1)
+			if errors.Is(err, storage.ErrNotFound) {
+				FatalError("proto not found: %s", protoID)
+			} else {
+				FatalError("loading proto %s: %v", protoID, err)
+			}
 		}
 		if !isProtoIssue(protoIssue) {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a proto (missing '%s' label)\n", protoID, MoleculeLabel)
-			os.Exit(1)
+			FatalError("%s is not a proto (missing '%s' label)", protoID, MoleculeLabel)
 		}
 
 		// Load the proto subgraph from DB
 		subgraph, err = loadTemplateSubgraph(ctx, store, protoID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading proto: %v\n", err)
-			os.Exit(1)
+			FatalError("loading proto: %v", err)
 		}
 	}
 
@@ -243,14 +234,15 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 		}
 	}
 	if len(missingVars) > 0 {
-		fmt.Fprintf(os.Stderr, "Error: missing required variables: %s\n", strings.Join(missingVars, ", "))
-		fmt.Fprintf(os.Stderr, "Provide them with: --var %s=<value>\n", missingVars[0])
-		os.Exit(1)
+		FatalErrorWithHint(
+			fmt.Sprintf("missing required variables: %s", strings.Join(missingVars, ", ")),
+			fmt.Sprintf("Provide them with: --var %s=<value>", missingVars[0]),
+		)
 	}
 
 	if dryRun {
 		fmt.Printf("\nDry run: would create wisp with %d issues from proto %s\n\n", len(subgraph.Issues), protoID)
-		fmt.Printf("Storage: main database (ephemeral=true, not exported to JSONL)\n\n")
+		fmt.Printf("Storage: main database (ephemeral=true, not synced via git)\n\n")
 		for _, issue := range subgraph.Issues {
 			newTitle := substituteVariables(issue.Title, vars)
 			fmt.Printf("  - %s (from %s)\n", newTitle, issue.ID)
@@ -258,15 +250,14 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Spawn as ephemeral in main database (Ephemeral=true, skips JSONL export)
+	// Spawn as ephemeral in main database (Ephemeral=true, not synced via git)
 	// Use wisp prefix for distinct visual recognition (see types.IDPrefixWisp)
 	result, err := spawnMolecule(ctx, store, subgraph, vars, "", actor, true, types.IDPrefixWisp)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating wisp: %v\n", err)
-		os.Exit(1)
+		FatalError("creating wisp: %v", err)
 	}
 
-	// Wisp issues are in main db but don't trigger JSONL export (Ephemeral flag excludes them)
+	// Wisp issues are in main db but not synced via git (Ephemeral flag excludes them)
 
 	if jsonOutput {
 		type wispCreateResult struct {
@@ -279,7 +270,7 @@ func runWispCreate(cmd *cobra.Command, args []string) {
 
 	fmt.Printf("%s Created wisp: %d issues\n", ui.RenderPass("✓"), result.Created)
 	fmt.Printf("  Root issue: %s\n", result.NewEpicID)
-	fmt.Printf("  Phase: vapor (ephemeral, not exported to JSONL)\n")
+	fmt.Printf("  Phase: vapor (ephemeral, not synced via git)\n")
 	fmt.Printf("\nNext steps:\n")
 	fmt.Printf("  bd close %s.<step>       # Complete steps\n", result.NewEpicID)
 	fmt.Printf("  bd mol squash %s         # Condense to digest (promotes to persistent)\n", result.NewEpicID)
@@ -299,8 +290,7 @@ func isProtoIssue(issue *types.Issue) bool {
 // resolvePartialIDDirect resolves a partial ID directly from store
 func resolvePartialIDDirect(ctx context.Context, partial string) (string, error) {
 	// Try direct lookup first
-	// Note: GetIssue returns (nil, nil) for not-found, so check both
-	if issue, err := store.GetIssue(ctx, partial); err == nil && issue != nil {
+	if issue, err := store.GetIssue(ctx, partial); err == nil {
 		return issue.ID, nil
 	}
 	// Search by prefix
@@ -325,7 +315,7 @@ var wispListCmd = &cobra.Command{
 	Long: `List all wisps (ephemeral molecules) in the current context.
 
 Wisps are issues with Ephemeral=true in the main database. They are stored
-locally but not exported to JSONL (and thus not synced via git).
+locally but not synced via git.
 
 The list shows:
   - ID: Issue ID of the wisp
@@ -367,11 +357,11 @@ func runWispList(cmd *cobra.Command, args []string) {
 	ephemeralFlag := true
 	filter := types.IssueFilter{
 		Ephemeral: &ephemeralFlag,
+		Limit:     5000,
 	}
 	issues, err := store.SearchIssues(ctx, "", filter)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listing wisps: %v\n", err)
-		os.Exit(1)
+		FatalError("listing wisps: %v", err)
 	}
 
 	// Filter closed issues unless --all is specified
@@ -550,16 +540,13 @@ func runWispGC(cmd *cobra.Command, args []string) {
 		var err error
 		ageThreshold, err = time.ParseDuration(ageStr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: invalid --age duration: %v\n", err)
-			os.Exit(1)
+			FatalError("invalid --age duration: %v", err)
 		}
 	}
 
 	// Wisp gc requires direct store access for deletion (daemon auto-bypassed for wisp ops)
 	if store == nil {
-		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		fmt.Fprintf(os.Stderr, "Hint: run 'bd init' or 'bd import' to initialize the database\n")
-		os.Exit(1)
+		FatalErrorWithHint("no database connection", "run 'bd init' or 'bd import' to initialize the database")
 	}
 
 	// --closed mode: purge all closed wisps (batch deletion)
@@ -572,11 +559,11 @@ func runWispGC(cmd *cobra.Command, args []string) {
 	ephemeralFlag := true
 	filter := types.IssueFilter{
 		Ephemeral: &ephemeralFlag,
+		Limit:     5000,
 	}
 	issues, err := store.SearchIssues(ctx, "", filter)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listing wisps: %v\n", err)
-		os.Exit(1)
+		FatalError("listing wisps: %v", err)
 	}
 
 	// Find old/abandoned wisps
@@ -647,12 +634,12 @@ func runWispPurgeClosed(ctx context.Context, dryRun bool, force bool) {
 	filter := types.IssueFilter{
 		Status:    &statusClosed,
 		Ephemeral: &ephemeralTrue,
+		Limit:     5000,
 	}
 
 	closedIssues, err := store.SearchIssues(ctx, "", filter)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listing closed wisps: %v\n", err)
-		os.Exit(1)
+		FatalError("listing closed wisps: %v", err)
 	}
 
 	// Filter out pinned issues (protected from cleanup)

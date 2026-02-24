@@ -1,5 +1,3 @@
-//go:build cgo
-
 package dolt
 
 import (
@@ -85,6 +83,11 @@ func TestIsRetryableError(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "no root value found in session",
+			err:      errors.New("Error 1105 (HY000): no root value found in session"),
+			expected: true,
+		},
+		{
 			name:     "syntax error - not retryable",
 			err:      errors.New("Error 1064: You have an error in your SQL syntax"),
 			expected: false,
@@ -106,26 +109,8 @@ func TestIsRetryableError(t *testing.T) {
 	}
 }
 
-func TestWithRetry_EmbeddedMode(t *testing.T) {
-	// In embedded mode (serverMode=false), withRetry should just call the operation once
-	store := &DoltStore{serverMode: false}
-
-	callCount := 0
-	err := store.withRetry(context.Background(), func() error {
-		callCount++
-		return errors.New("driver: bad connection")
-	})
-
-	if err == nil {
-		t.Error("expected error, got nil")
-	}
-	if callCount != 1 {
-		t.Errorf("expected 1 call in embedded mode, got %d", callCount)
-	}
-}
-
-func TestWithRetry_ServerMode_Success(t *testing.T) {
-	store := &DoltStore{serverMode: true}
+func TestWithRetry_Success(t *testing.T) {
+	store := &DoltStore{}
 
 	callCount := 0
 	err := store.withRetry(context.Background(), func() error {
@@ -141,8 +126,8 @@ func TestWithRetry_ServerMode_Success(t *testing.T) {
 	}
 }
 
-func TestWithRetry_ServerMode_RetryOnBadConnection(t *testing.T) {
-	store := &DoltStore{serverMode: true}
+func TestWithRetry_RetryOnBadConnection(t *testing.T) {
+	store := &DoltStore{}
 
 	callCount := 0
 	err := store.withRetry(context.Background(), func() error {
@@ -161,9 +146,9 @@ func TestWithRetry_ServerMode_RetryOnBadConnection(t *testing.T) {
 	}
 }
 
-func TestWithRetry_ServerMode_RetryOnUnknownDatabase(t *testing.T) {
+func TestWithRetry_RetryOnUnknownDatabase(t *testing.T) {
 	// Simulates the GH-1851 race: "Unknown database" is transient after CREATE DATABASE
-	store := &DoltStore{serverMode: true}
+	store := &DoltStore{}
 
 	callCount := 0
 	err := store.withRetry(context.Background(), func() error {
@@ -182,8 +167,8 @@ func TestWithRetry_ServerMode_RetryOnUnknownDatabase(t *testing.T) {
 	}
 }
 
-func TestWithRetry_ServerMode_NonRetryableError(t *testing.T) {
-	store := &DoltStore{serverMode: true}
+func TestWithRetry_NonRetryableError(t *testing.T) {
+	store := &DoltStore{}
 
 	callCount := 0
 	err := store.withRetry(context.Background(), func() error {

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/utils"
 	"github.com/steveyegge/beads/internal/validation"
@@ -42,11 +43,10 @@ Examples:
 
 		// If no query provided, show help
 		if query == "" {
-			fmt.Fprintf(os.Stderr, "Error: search query is required\n")
 			if err := cmd.Help(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error displaying help: %v\n", err)
 			}
-			os.Exit(1)
+			FatalError("search query is required")
 		}
 
 		// Get filter flags
@@ -135,48 +135,42 @@ Examples:
 		if createdAfter != "" {
 			t, err := parseTimeFlag(createdAfter)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --created-after: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --created-after: %v", err)
 			}
 			filter.CreatedAfter = &t
 		}
 		if createdBefore != "" {
 			t, err := parseTimeFlag(createdBefore)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --created-before: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --created-before: %v", err)
 			}
 			filter.CreatedBefore = &t
 		}
 		if updatedAfter != "" {
 			t, err := parseTimeFlag(updatedAfter)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --updated-after: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --updated-after: %v", err)
 			}
 			filter.UpdatedAfter = &t
 		}
 		if updatedBefore != "" {
 			t, err := parseTimeFlag(updatedBefore)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --updated-before: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --updated-before: %v", err)
 			}
 			filter.UpdatedBefore = &t
 		}
 		if closedAfter != "" {
 			t, err := parseTimeFlag(closedAfter)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --closed-after: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --closed-after: %v", err)
 			}
 			filter.ClosedAfter = &t
 		}
 		if closedBefore != "" {
 			t, err := parseTimeFlag(closedBefore)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --closed-before: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --closed-before: %v", err)
 			}
 			filter.ClosedBefore = &t
 		}
@@ -185,18 +179,42 @@ Examples:
 		if cmd.Flags().Changed("priority-min") {
 			priorityMin, err := validation.ValidatePriority(priorityMinStr)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --priority-min: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --priority-min: %v", err)
 			}
 			filter.PriorityMin = &priorityMin
 		}
 		if cmd.Flags().Changed("priority-max") {
 			priorityMax, err := validation.ValidatePriority(priorityMaxStr)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --priority-max: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --priority-max: %v", err)
 			}
 			filter.PriorityMax = &priorityMax
+		}
+
+		// Metadata filters (GH#1406)
+		metadataFieldFlags, _ := cmd.Flags().GetStringArray("metadata-field")
+		if len(metadataFieldFlags) > 0 {
+			filter.MetadataFields = make(map[string]string, len(metadataFieldFlags))
+			for _, mf := range metadataFieldFlags {
+				k, v, ok := strings.Cut(mf, "=")
+				if !ok || k == "" {
+					fmt.Fprintf(os.Stderr, "Error: invalid --metadata-field: expected key=value, got %q\n", mf)
+					os.Exit(1)
+				}
+				if err := storage.ValidateMetadataKey(k); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: invalid --metadata-field key: %v\n", err)
+					os.Exit(1)
+				}
+				filter.MetadataFields[k] = v
+			}
+		}
+		hasMetadataKey, _ := cmd.Flags().GetString("has-metadata-key")
+		if hasMetadataKey != "" {
+			if err := storage.ValidateMetadataKey(hasMetadataKey); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid --has-metadata-key: %v\n", err)
+				os.Exit(1)
+			}
+			filter.HasMetadataKey = hasMetadataKey
 		}
 
 		ctx := rootCtx
@@ -205,8 +223,7 @@ Examples:
 		// The query parameter in SearchIssues already searches across title, description, and id
 		issues, err := store.SearchIssues(ctx, query, filter)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 
 		// Apply sorting
@@ -313,7 +330,7 @@ func outputSearchResults(issues []*types.Issue, query string, longFormat bool) {
 
 func init() {
 	searchCmd.Flags().String("query", "", "Search query (alternative to positional argument)")
-	searchCmd.Flags().StringP("status", "s", "", "Filter by status (open, in_progress, blocked, deferred, closed)")
+	searchCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Note: dependency-blocked issues use 'bd blocked'")
 	searchCmd.Flags().StringP("assignee", "a", "", "Filter by assignee")
 	searchCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, decision, merge-request, molecule, gate)")
 	searchCmd.Flags().StringSliceP("label", "l", []string{}, "Filter by labels (AND: must have ALL)")
@@ -343,6 +360,10 @@ func init() {
 	searchCmd.Flags().Bool("empty-description", false, "Filter issues with empty or missing description")
 	searchCmd.Flags().Bool("no-assignee", false, "Filter issues with no assignee")
 	searchCmd.Flags().Bool("no-labels", false, "Filter issues with no labels")
+
+	// Metadata filtering (GH#1406)
+	searchCmd.Flags().StringArray("metadata-field", nil, "Filter by metadata field (key=value, repeatable)")
+	searchCmd.Flags().String("has-metadata-key", "", "Filter issues that have this metadata key set")
 
 	rootCmd.AddCommand(searchCmd)
 }

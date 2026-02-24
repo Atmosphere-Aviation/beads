@@ -8,13 +8,13 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // setupValidateTestDB creates a temp .beads workspace with a configured database.
-// The caller must call store.Close() when done inserting test data.
+// Uses newTestStoreWithPrefix to ensure metadata.json has the correct database name
+// so that collectValidateChecks (which reads metadata.json) connects to the right DB.
 func setupValidateTestDB(t *testing.T, prefix string) (tmpDir string, store *dolt.DoltStore) {
 	t.Helper()
 	tmpDir = t.TempDir()
@@ -23,26 +23,8 @@ func setupValidateTestDB(t *testing.T, prefix string) (tmpDir string, store *dol
 		t.Fatal(err)
 	}
 
-	// Save metadata.json so factory knows to use Dolt backend
-	cfg := configfile.DefaultConfig()
-	cfg.Backend = configfile.BackendDolt
-	if err := cfg.Save(beadsDir); err != nil {
-		t.Fatalf("Failed to save config: %v", err)
-	}
-
 	dbPath := filepath.Join(beadsDir, "dolt")
-	ctx := context.Background()
-
-	var err error
-	store, err = dolt.New(ctx, &dolt.Config{Path: dbPath})
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
-
-	if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
-		t.Fatalf("Failed to set issue_prefix: %v", err)
-	}
+	store = newTestStoreWithPrefix(t, dbPath, prefix)
 
 	return tmpDir, store
 }
@@ -126,10 +108,17 @@ func TestValidateCheck_DetectsOrphanedDeps(t *testing.T) {
 	}
 
 	db := store.UnderlyingDB()
-	_, err := db.Exec("INSERT INTO dependencies (issue_id, depends_on_id, type, created_by) VALUES (?, ?, ?, ?)",
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+	_, err = tx.Exec("INSERT INTO dependencies (issue_id, depends_on_id, type, created_by) VALUES (?, ?, ?, ?)",
 		issue.ID, "test-nonexistent", "blocks", "test")
 	if err != nil {
 		t.Fatalf("Failed to insert orphaned dep: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Failed to commit orphaned dep: %v", err)
 	}
 	store.Close()
 
@@ -239,10 +228,17 @@ func TestValidateCheck_FixOrphanedDeps(t *testing.T) {
 	}
 
 	db := store.UnderlyingDB()
-	_, err := db.Exec("INSERT INTO dependencies (issue_id, depends_on_id, type, created_by) VALUES (?, ?, ?, ?)",
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+	_, err = tx.Exec("INSERT INTO dependencies (issue_id, depends_on_id, type, created_by) VALUES (?, ?, ?, ?)",
 		issue.ID, "test-nonexistent", "blocks", "test")
 	if err != nil {
 		t.Fatalf("Failed to insert orphaned dep: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Failed to commit orphaned dep: %v", err)
 	}
 	store.Close()
 

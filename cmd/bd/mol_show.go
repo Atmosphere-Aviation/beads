@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -34,20 +33,17 @@ Example:
 
 		// mol show requires direct store access for subgraph loading
 		if store == nil {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
+			FatalError("no database connection")
 		}
 
 		moleculeID, err := utils.ResolvePartialID(ctx, store, args[0])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: molecule '%s' not found\n", args[0])
-			os.Exit(1)
+			FatalError("molecule '%s' not found", args[0])
 		}
 
 		subgraph, err := loadTemplateSubgraph(ctx, store, moleculeID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-			os.Exit(1)
+			FatalError("loading molecule: %v", err)
 		}
 
 		if molShowParallel {
@@ -177,22 +173,65 @@ func analyzeMoleculeParallel(subgraph *MoleculeSubgraph) *ParallelAnalysis {
 	// blocks[id] = set of issue IDs that this issue blocks
 	blockedBy := make(map[string]map[string]bool)
 	blocks := make(map[string]map[string]bool)
+	parentChildren := make(map[string][]string)
 
 	for _, issue := range subgraph.Issues {
 		blockedBy[issue.ID] = make(map[string]bool)
 		blocks[issue.ID] = make(map[string]bool)
 	}
 
+	// Build child index for waits-for gate evaluation.
+	for _, dep := range subgraph.Dependencies {
+		if dep.Type == types.DepParentChild {
+			parentChildren[dep.DependsOnID] = append(parentChildren[dep.DependsOnID], dep.IssueID)
+		}
+	}
+
 	// Process dependencies to find blocking relationships
 	for _, dep := range subgraph.Dependencies {
-		// Only blocking dependencies affect parallel execution
-		if dep.Type == types.DepBlocks || dep.Type == types.DepConditionalBlocks {
+		switch dep.Type {
+		case types.DepBlocks, types.DepConditionalBlocks:
 			// dep.IssueID depends on (is blocked by) dep.DependsOnID
 			if _, ok := blockedBy[dep.IssueID]; ok {
 				blockedBy[dep.IssueID][dep.DependsOnID] = true
 			}
 			if _, ok := blocks[dep.DependsOnID]; ok {
 				blocks[dep.DependsOnID][dep.IssueID] = true
+			}
+		case types.DepWaitsFor:
+			children := parentChildren[dep.DependsOnID]
+			if len(children) == 0 {
+				continue
+			}
+
+			gate := types.ParseWaitsForGateMetadata(dep.Metadata)
+			if gate == types.WaitsForAnyChildren {
+				hasClosedChild := false
+				for _, childID := range children {
+					child := subgraph.IssueMap[childID]
+					if child != nil && child.Status == types.StatusClosed {
+						hasClosedChild = true
+						break
+					}
+				}
+				if hasClosedChild {
+					continue
+				}
+			}
+
+			// For all-children (and unresolved any-children), each open child blocks the gate.
+			for _, childID := range children {
+				child := subgraph.IssueMap[childID]
+				if child == nil || child.Status == types.StatusClosed {
+					continue
+				}
+
+				if _, ok := blockedBy[dep.IssueID]; ok {
+					blockedBy[dep.IssueID][childID] = true
+				}
+				if _, ok := blocks[childID]; ok {
+					blocks[childID][dep.IssueID] = true
+				}
 			}
 		}
 	}

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -90,8 +89,7 @@ func runMolBond(cmd *cobra.Command, args []string) {
 
 	// mol bond requires direct store access
 	if store == nil {
-		fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		os.Exit(1)
+		FatalError("no database connection")
 	}
 
 	bondType, _ := cmd.Flags().GetString("type")
@@ -104,8 +102,7 @@ func runMolBond(cmd *cobra.Command, args []string) {
 
 	// Validate phase flags are not both set
 	if ephemeral && pour {
-		fmt.Fprintf(os.Stderr, "Error: cannot use both --ephemeral and --pour\n")
-		os.Exit(1)
+		FatalError("cannot use both --ephemeral and --pour")
 	}
 
 	// All issues go in the main store; ephemeral vs pour determines the Wisp flag
@@ -115,8 +112,7 @@ func runMolBond(cmd *cobra.Command, args []string) {
 
 	// Validate bond type
 	if bondType != types.BondTypeSequential && bondType != types.BondTypeParallel && bondType != types.BondTypeConditional {
-		fmt.Fprintf(os.Stderr, "Error: invalid bond type '%s', must be: sequential, parallel, or conditional\n", bondType)
-		os.Exit(1)
+		FatalError("invalid bond type '%s', must be: sequential, parallel, or conditional", bondType)
 	}
 
 	// Parse variables
@@ -124,8 +120,7 @@ func runMolBond(cmd *cobra.Command, args []string) {
 	for _, v := range varFlags {
 		parts := strings.SplitN(v, "=", 2)
 		if len(parts) != 2 {
-			fmt.Fprintf(os.Stderr, "Error: invalid variable format '%s', expected 'key=value'\n", v)
-			os.Exit(1)
+			FatalError("invalid variable format '%s', expected 'key=value'", v)
 		}
 		vars[parts[0]] = parts[1]
 	}
@@ -134,13 +129,11 @@ func runMolBond(cmd *cobra.Command, args []string) {
 	if dryRun {
 		issueA, formulaA, err := resolveOrDescribe(ctx, store, args[0])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		issueB, formulaB, err := resolveOrDescribe(ctx, store, args[1])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 
 		idA := args[0]
@@ -207,13 +200,11 @@ func runMolBond(cmd *cobra.Command, args []string) {
 	// Pass vars for step condition filtering (bd-7zka.1)
 	subgraphA, cookedA, err := resolveOrCookToSubgraph(ctx, store, args[0], vars)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 	subgraphB, cookedB, err := resolveOrCookToSubgraph(ctx, store, args[1], vars)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		FatalError("%v", err)
 	}
 
 	// No cleanup needed - in-memory subgraphs don't pollute the DB
@@ -253,8 +244,7 @@ func runMolBond(cmd *cobra.Command, args []string) {
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error bonding: %v\n", err)
-		os.Exit(1)
+		FatalError("bonding: %v", err)
 	}
 
 	if jsonOutput {
@@ -302,7 +292,7 @@ func bondProtoProto(ctx context.Context, s *dolt.DoltStore, protoA, protoB *type
 	}
 
 	var compoundID string
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+	err := transact(ctx, s, fmt.Sprintf("bd: bond protos %s + %s", protoA.ID, protoB.ID), func(tx storage.Transaction) error {
 		// Create compound root issue
 		compound := &types.Issue{
 			Title:       compoundTitle,
@@ -417,11 +407,28 @@ func bondProtoMolWithSubgraph(ctx context.Context, s *dolt.DoltStore, protoSubgr
 		makeEphemeral = false
 	}
 
+	// Determine dependency type for attachment
+	// Sequential: use blocks (B runs after A completes)
+	// Conditional: use conditional-blocks (B runs only if A fails)
+	// Parallel: use parent-child (organizational, no blocking)
+	var depType types.DependencyType
+	switch bondType {
+	case types.BondTypeSequential:
+		depType = types.DepBlocks
+	case types.BondTypeConditional:
+		depType = types.DepConditionalBlocks
+	default:
+		depType = types.DepParentChild
+	}
+
 	// Build CloneOptions for spawning
+	// AttachToID ensures spawn + attach happen in a single transaction (bd-wvplu)
 	opts := CloneOptions{
-		Vars:      vars,
-		Actor:     actorName,
-		Ephemeral: makeEphemeral,
+		Vars:          vars,
+		Actor:         actorName,
+		Ephemeral:     makeEphemeral,
+		AttachToID:    mol.ID,
+		AttachDepType: depType,
 	}
 
 	// Dynamic bonding: use custom IDs if childRef is provided
@@ -430,40 +437,10 @@ func bondProtoMolWithSubgraph(ctx context.Context, s *dolt.DoltStore, protoSubgr
 		opts.ChildRef = childRef
 	}
 
-	// Spawn the proto with options
+	// Spawn the proto and atomically attach to molecule
 	spawnResult, err := spawnMoleculeWithOptions(ctx, s, subgraph, opts)
 	if err != nil {
-		return nil, fmt.Errorf("spawning proto: %w", err)
-	}
-
-	// Attach spawned molecule to existing molecule
-	err = s.RunInTransaction(ctx, func(tx storage.Transaction) error {
-		// Add dependency from spawned root to molecule
-		// Sequential: use blocks (B runs after A completes)
-		// Conditional: use conditional-blocks (B runs only if A fails)
-		// Parallel: use parent-child (organizational, no blocking)
-		// Note: Schema only allows one dependency per (issue_id, depends_on_id) pair
-		var depType types.DependencyType
-		switch bondType {
-		case types.BondTypeSequential:
-			depType = types.DepBlocks
-		case types.BondTypeConditional:
-			depType = types.DepConditionalBlocks
-		default:
-			depType = types.DepParentChild
-		}
-		dep := &types.Dependency{
-			IssueID:     spawnResult.NewEpicID,
-			DependsOnID: mol.ID,
-			Type:        depType,
-		}
-		return tx.AddDependency(ctx, dep, actorName)
-		// Note: bonded_from field tracking is not yet supported by storage layer.
-		// The dependency relationship captures the bonding semantics.
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("attaching to molecule: %w", err)
+		return nil, fmt.Errorf("spawning and attaching proto: %w", err)
 	}
 
 	return &BondResult{
@@ -483,7 +460,7 @@ func bondMolProto(ctx context.Context, s *dolt.DoltStore, mol, proto *types.Issu
 
 // bondMolMol bonds two molecules together
 func bondMolMol(ctx context.Context, s *dolt.DoltStore, molA, molB *types.Issue, bondType, actorName string) (*BondResult, error) {
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+	err := transact(ctx, s, fmt.Sprintf("bd: bond molecules %s + %s", molA.ID, molB.ID), func(tx storage.Transaction) error {
 		// Add dependency: B links to A
 		// Sequential: use blocks (B runs after A completes)
 		// Conditional: use conditional-blocks (B runs only if A fails)

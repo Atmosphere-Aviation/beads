@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -69,8 +68,7 @@ NOTE: This is a rare operation. Most users never need this command.`,
 		if isGitRepo() && git.IsWorktree() {
 			mainRepoRoot, _ := git.GetMainRepoRoot()
 			fmt.Fprintf(os.Stderr, "Error: cannot run 'bd rename-prefix' from a git worktree\n\n")
-			fmt.Fprintf(os.Stderr, "Worktrees share the .beads database from the main repository,\n")
-			fmt.Fprintf(os.Stderr, "but JSONL export targets the main worktree's file.\n\n")
+			fmt.Fprintf(os.Stderr, "Worktrees share the .beads database from the main repository.\n\n")
 			fmt.Fprintf(os.Stderr, "Run this command from the main repository instead:\n")
 			fmt.Fprintf(os.Stderr, "  cd %s\n", mainRepoRoot)
 			fmt.Fprintf(os.Stderr, "  bd rename-prefix %s\n", newPrefix)
@@ -80,52 +78,17 @@ NOTE: This is a rare operation. Most users never need this command.`,
 		// rename-prefix requires direct database access
 		if store == nil {
 			if err := ensureStoreActive(); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 		}
 
 		if err := validatePrefix(newPrefix); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Get JSONL path for sync operations
-		jsonlPath := findJSONLPath()
-
-		// Force import from JSONL to ensure DB has all issues before rename
-		// This prevents data loss if JSONL has issues from other workspaces
-		if !dryRun && jsonlPath != "" {
-			if _, err := os.Stat(jsonlPath); err == nil {
-				// JSONL exists - force import to sync all issues to DB
-				issues, err := parseJSONLFile(jsonlPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error: failed to read JSONL before rename: %v\n", err)
-					os.Exit(1)
-				}
-				if len(issues) > 0 {
-					opts := ImportOptions{
-						DryRun:               false,
-						SkipUpdate:           false,
-						Strict:               false,
-						SkipPrefixValidation: true, // Allow any prefix during rename
-					}
-					result, err := importIssuesCore(ctx, dbPath, store, issues, opts)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error: failed to sync JSONL before rename: %v\n", err)
-						os.Exit(1)
-					}
-					if result.Created > 0 || result.Updated > 0 {
-						fmt.Printf("Synced %d issues from JSONL before rename\n", result.Created+result.Updated)
-					}
-				}
-			}
+			FatalError("%v", err)
 		}
 
 		oldPrefix, err := store.GetConfig(ctx, "issue_prefix")
 		if err != nil || oldPrefix == "" {
-			fmt.Fprintf(os.Stderr, "Error: failed to get current prefix: %v\n", err)
-			os.Exit(1)
+			FatalError("failed to get current prefix: %v", err)
 		}
 
 		newPrefix = strings.TrimRight(newPrefix, "-")
@@ -133,8 +96,7 @@ NOTE: This is a rare operation. Most users never need this command.`,
 		// Check for multiple prefixes first
 		issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to list issues: %v\n", err)
-			os.Exit(1)
+			FatalError("failed to list issues: %v", err)
 		}
 
 		prefixes := detectPrefixes(issues)
@@ -149,23 +111,22 @@ NOTE: This is a rare operation. Most users never need this command.`,
 			fmt.Fprintf(os.Stderr, "\n")
 
 			if !repair {
-				fmt.Fprintf(os.Stderr, "Error: cannot rename with multiple prefixes. Use --repair to consolidate.\n")
-				fmt.Fprintf(os.Stderr, "Example: bd rename-prefix %s --repair\n", newPrefix)
-				os.Exit(1)
+				FatalErrorWithHint(
+					"cannot rename with multiple prefixes. Use --repair to consolidate.",
+					fmt.Sprintf("Example: bd rename-prefix %s --repair", newPrefix),
+				)
 			}
 
 			// Repair mode: consolidate all prefixes to newPrefix
 			if err := repairPrefixes(ctx, store, actor, newPrefix, issues, prefixes, dryRun); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to repair prefixes: %v\n", err)
-				os.Exit(1)
+				FatalError("failed to repair prefixes: %v", err)
 			}
 			return
 		}
 
 		// Single prefix case - check if trying to rename to same prefix
 		if len(prefixes) == 1 && oldPrefix == newPrefix {
-			fmt.Fprintf(os.Stderr, "Error: new prefix is the same as current prefix: %s\n", oldPrefix)
-			os.Exit(1)
+			FatalError("new prefix is the same as current prefix: %s", oldPrefix)
 		}
 
 		// issues already fetched above
@@ -173,8 +134,7 @@ NOTE: This is a rare operation. Most users never need this command.`,
 			fmt.Printf("No issues to rename. Updating prefix to %s\n", newPrefix)
 			if !dryRun {
 				if err := store.SetConfig(ctx, "issue_prefix", newPrefix); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: failed to update prefix: %v\n", err)
-					os.Exit(1)
+					FatalError("failed to update prefix: %v", err)
 				}
 			}
 			return
@@ -198,24 +158,7 @@ NOTE: This is a rare operation. Most users never need this command.`,
 		fmt.Printf("Renaming %d issues from prefix '%s' to '%s'...\n", len(issues), oldPrefix, newPrefix)
 
 		if err := renamePrefixInDB(ctx, oldPrefix, newPrefix, issues); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to rename prefix: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Force export to JSONL with new IDs
-		// Safe because we imported all JSONL issues before rename
-		if jsonlPath != "" {
-			// Clear metadata hashes so integrity check doesn't fail
-			_ = store.SetMetadata(ctx, "jsonl_content_hash", "") // Best effort: stale hashes will be recomputed on next export
-			_ = store.SetMetadata(ctx, "export_hashes", "")      // Best effort: stale hashes will be recomputed on next export
-
-			// Export renamed issues directly to JSONL
-			if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to export: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Run 'bd export --force' to update JSONL\n")
-			} else {
-				fmt.Printf("Updated %s with new IDs\n", jsonlPath)
-			}
+			FatalError("failed to rename prefix: %v", err)
 		}
 
 		fmt.Printf("%s Successfully renamed prefix from %s to %s\n", ui.RenderPass("✓"), ui.RenderAccent(oldPrefix), ui.RenderAccent(newPrefix))
@@ -409,23 +352,6 @@ func repairPrefixes(ctx context.Context, st *dolt.DoltStore, actorName string, t
 		return fmt.Errorf("failed to update config: %w", err)
 	}
 
-	// Force export to JSONL with new IDs
-	// Safe because we imported all JSONL issues before repair (done in caller)
-	jsonlPath := findJSONLPath()
-	if jsonlPath != "" {
-		// Clear metadata hashes so integrity check doesn't fail
-		_ = st.SetMetadata(ctx, "jsonl_content_hash", "") // Best effort: stale hashes will be recomputed on next export
-		_ = st.SetMetadata(ctx, "export_hashes", "")      // Best effort: stale hashes will be recomputed on next export
-
-		// Export renamed issues directly to JSONL
-		if err := exportToJSONLWithStore(ctx, st, jsonlPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to export: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Run 'bd export --force' to update JSONL\n")
-		} else {
-			fmt.Printf("Updated %s with new IDs\n", jsonlPath)
-		}
-	}
-
 	fmt.Printf("\n%s Successfully consolidated %d prefixes into %s\n",
 		ui.RenderPass("✓"), len(prefixes), ui.RenderAccent(targetPrefix))
 	fmt.Printf("  %d issues repaired, %d issues unchanged\n", len(incorrectIssues), len(correctIssues))
@@ -533,43 +459,6 @@ func generateRepairHashID(prefix string, issue *types.Issue, actor string, usedI
 	}
 
 	return newID, nil
-}
-
-// parseJSONLFile reads and parses a JSONL file into a slice of issues
-func parseJSONLFile(jsonlPath string) ([]*types.Issue, error) {
-	// #nosec G304 - jsonlPath is from findJSONLPath() which uses trusted paths
-	f, err := os.Open(jsonlPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open JSONL file: %w", err)
-	}
-	defer f.Close()
-
-	var issues []*types.Issue
-	scanner := bufio.NewScanner(f)
-	// Increase buffer to handle large JSON lines
-	scanner.Buffer(make([]byte, 0, 1024), 2*1024*1024) // 2MB max line size
-
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-
-		var issue types.Issue
-		if err := json.Unmarshal([]byte(line), &issue); err != nil {
-			return nil, fmt.Errorf("parse error at line %d: %w", lineNum, err)
-		}
-		issue.SetDefaults()
-		issues = append(issues, &issue)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scanner error: %w", err)
-	}
-
-	return issues, nil
 }
 
 func init() {

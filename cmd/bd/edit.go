@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -71,10 +73,10 @@ Examples:
 		// Get the current issue
 		issue, err := store.GetIssue(ctx, id)
 		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				FatalErrorRespectJSON("issue %s not found", id)
+			}
 			FatalErrorRespectJSON("fetching issue %s: %v", id, err)
-		}
-		if issue == nil {
-			FatalErrorRespectJSON("issue %s not found", id)
 		}
 
 		// Get the current field value
@@ -126,7 +128,7 @@ Examples:
 			FatalErrorRespectJSON("reading edited file: %v", err)
 		}
 
-		newValue := string(editedContent)
+		newValue := strings.TrimSpace(string(editedContent))
 
 		// Check if the value changed
 		if newValue == currentValue {
@@ -135,7 +137,7 @@ Examples:
 		}
 
 		// Validate title if editing title
-		if fieldToEdit == "title" && strings.TrimSpace(newValue) == "" {
+		if fieldToEdit == "title" && newValue == "" {
 			FatalErrorRespectJSON("title cannot be empty")
 		}
 

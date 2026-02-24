@@ -2,15 +2,59 @@ package beads_test
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads"
+	"github.com/steveyegge/beads/internal/testutil"
 )
 
+// testServerPort is the port of the shared test Dolt server (0 = not running).
+var testServerPort int
+
+func TestMain(m *testing.M) {
+	srv, cleanup := testutil.StartTestDoltServer("beads-root-test-*")
+	if srv != nil {
+		testServerPort = srv.Port
+		os.Setenv("BEADS_DOLT_PORT", fmt.Sprintf("%d", srv.Port))
+	}
+
+	code := m.Run()
+
+	os.Unsetenv("BEADS_DOLT_PORT")
+	cleanup()
+	os.Exit(code)
+}
+
+func skipIfNoDolt(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("Dolt not installed, skipping test")
+	}
+}
+
+func skipIfNoDoltServer(t *testing.T) {
+	t.Helper()
+	if testServerPort == 0 {
+		t.Skip("Test Dolt server not available, skipping test")
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", testServerPort)
+	conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err != nil {
+		t.Skipf("Dolt server not running on %s, skipping test", addr)
+	}
+	_ = conn.Close()
+}
+
 func TestOpen(t *testing.T) {
+	skipIfNoDolt(t)
+
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test-dolt")
 
@@ -40,25 +84,11 @@ func TestFindBeadsDir(t *testing.T) {
 	_ = dir
 }
 
-func TestFindJSONLPath(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, ".beads", "beads.db")
-
-	// Create the directory
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		t.Fatalf("failed to create directory: %v", err)
-	}
-
-	jsonlPath := beads.FindJSONLPath(dbPath)
-	// bd-6xd: Default is now issues.jsonl (canonical name)
-	expectedPath := filepath.Join(tmpDir, ".beads", "issues.jsonl")
-
-	if jsonlPath != expectedPath {
-		t.Errorf("FindJSONLPath returned %s, expected %s", jsonlPath, expectedPath)
-	}
-}
-
 func TestOpenFromConfig_Embedded(t *testing.T) {
+	// This test requires a running Dolt server (embedded mode is not yet implemented;
+	// New() always connects via MySQL protocol to dolt sql-server).
+	skipIfNoDoltServer(t)
+
 	// Create a .beads dir with metadata.json configured for embedded mode
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -84,6 +114,10 @@ func TestOpenFromConfig_Embedded(t *testing.T) {
 }
 
 func TestOpenFromConfig_DefaultsToEmbedded(t *testing.T) {
+	// This test requires a running Dolt server (embedded mode is not yet implemented;
+	// New() always connects via MySQL protocol to dolt sql-server).
+	skipIfNoDoltServer(t)
+
 	// metadata.json without dolt_mode should default to embedded
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -116,25 +150,33 @@ func TestOpenFromConfig_ServerModeFailsWithoutServer(t *testing.T) {
 		t.Fatalf("failed to create .beads dir: %v", err)
 	}
 
-	// Use a port that's very unlikely to have a server
-	metadata := `{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_server_host":"127.0.0.1","dolt_server_port":39999}`
+	// Dynamically find an unused port by binding to :0 then closing
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	freePort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	metadata := fmt.Sprintf(`{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_server_host":"127.0.0.1","dolt_server_port":%d}`, freePort)
 	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
 		t.Fatalf("failed to write metadata.json: %v", err)
 	}
 
 	ctx := context.Background()
-	_, err := beads.OpenFromConfig(ctx, beadsDir)
-	if err == nil {
+	_, openErr := beads.OpenFromConfig(ctx, beadsDir)
+	if openErr == nil {
 		t.Fatal("OpenFromConfig (server mode) should fail when no server is running")
 	}
 	// Should contain "unreachable" from the fail-fast TCP check
-	if !strings.Contains(err.Error(), "unreachable") {
-		t.Errorf("expected 'unreachable' in error, got: %v", err)
+	if !strings.Contains(openErr.Error(), "unreachable") {
+		t.Errorf("expected 'unreachable' in error, got: %v", openErr)
 	}
 }
 
 func TestOpenFromConfig_NoMetadata(t *testing.T) {
-	// Missing metadata.json should use defaults (embedded mode)
+	skipIfNoDolt(t)
+	// Missing metadata.json should use defaults (server mode)
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {

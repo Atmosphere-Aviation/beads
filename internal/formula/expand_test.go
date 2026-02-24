@@ -742,6 +742,225 @@ func TestApplyExpansionsDuplicateIDs(t *testing.T) {
 	})
 }
 
+func TestApplyExpansionsCrossExpansionDeps(t *testing.T) {
+	// Regression test: when two steps have a dependency chain and both are expanded,
+	// the first substep of the second expansion must inherit the resolved dependency
+	// on the last substep of the first expansion.
+	tmpDir := t.TempDir()
+
+	// Expansion template: target → target.sub-a, target.sub-b (chained)
+	expansion := `{
+		"formula": "two-step-expansion",
+		"type": "expansion",
+		"version": 1,
+		"template": [
+			{"id": "{target}.sub-a", "title": "Sub A of {target.title}"},
+			{"id": "{target}.sub-b", "title": "Sub B of {target.title}", "needs": ["{target}.sub-a"]}
+		]
+	}`
+	err := os.WriteFile(filepath.Join(tmpDir, "two-step-expansion.formula.json"), []byte(expansion), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parser := NewParser(tmpDir)
+
+	t.Run("expand two chained steps preserves cross-expansion deps", func(t *testing.T) {
+		steps := []*Step{
+			{ID: "step-1", Title: "Step 1"},
+			{ID: "step-2", Title: "Step 2", Needs: []string{"step-1"}},
+		}
+
+		compose := &ComposeRules{
+			Expand: []*ExpandRule{
+				{Target: "step-1", With: "two-step-expansion"},
+				{Target: "step-2", With: "two-step-expansion"},
+			},
+		}
+
+		result, err := ApplyExpansions(steps, compose, parser)
+		if err != nil {
+			t.Fatalf("ApplyExpansions failed: %v", err)
+		}
+
+		if len(result) != 4 {
+			t.Fatalf("expected 4 steps, got %d", len(result))
+		}
+
+		// Verify step IDs
+		expectedIDs := []string{"step-1.sub-a", "step-1.sub-b", "step-2.sub-a", "step-2.sub-b"}
+		for i, exp := range expectedIDs {
+			if result[i].ID != exp {
+				t.Errorf("result[%d].ID = %q, want %q", i, result[i].ID, exp)
+			}
+		}
+
+		// KEY ASSERTION: step-2.sub-a must need step-1.sub-b (the last step of step-1's expansion)
+		// Before the fix, this was [] (empty).
+		step2SubA := result[2]
+		if len(step2SubA.Needs) != 1 || step2SubA.Needs[0] != "step-1.sub-b" {
+			t.Errorf("step-2.sub-a.Needs = %v, want [step-1.sub-b]", step2SubA.Needs)
+		}
+
+		// step-2.sub-b should need step-2.sub-a (internal template dep)
+		step2SubB := result[3]
+		if len(step2SubB.Needs) != 1 || step2SubB.Needs[0] != "step-2.sub-a" {
+			t.Errorf("step-2.sub-b.Needs = %v, want [step-2.sub-a]", step2SubB.Needs)
+		}
+
+		// step-1.sub-a should have no deps (root of entire chain)
+		if len(result[0].Needs) != 0 {
+			t.Errorf("step-1.sub-a.Needs = %v, want []", result[0].Needs)
+		}
+	})
+
+	t.Run("expand three chained steps preserves full dependency chain", func(t *testing.T) {
+		steps := []*Step{
+			{ID: "step-1", Title: "Step 1"},
+			{ID: "step-2", Title: "Step 2", Needs: []string{"step-1"}},
+			{ID: "step-3", Title: "Step 3", Needs: []string{"step-2"}},
+		}
+
+		compose := &ComposeRules{
+			Expand: []*ExpandRule{
+				{Target: "step-1", With: "two-step-expansion"},
+				{Target: "step-2", With: "two-step-expansion"},
+				{Target: "step-3", With: "two-step-expansion"},
+			},
+		}
+
+		result, err := ApplyExpansions(steps, compose, parser)
+		if err != nil {
+			t.Fatalf("ApplyExpansions failed: %v", err)
+		}
+
+		if len(result) != 6 {
+			t.Fatalf("expected 6 steps, got %d", len(result))
+		}
+
+		// step-2.sub-a needs step-1.sub-b
+		if len(result[2].Needs) != 1 || result[2].Needs[0] != "step-1.sub-b" {
+			t.Errorf("step-2.sub-a.Needs = %v, want [step-1.sub-b]", result[2].Needs)
+		}
+
+		// step-3.sub-a needs step-2.sub-b
+		if len(result[4].Needs) != 1 || result[4].Needs[0] != "step-2.sub-b" {
+			t.Errorf("step-3.sub-a.Needs = %v, want [step-2.sub-b]", result[4].Needs)
+		}
+	})
+
+	t.Run("expand with depends_on preserves cross-expansion deps", func(t *testing.T) {
+		steps := []*Step{
+			{ID: "step-1", Title: "Step 1"},
+			{ID: "step-2", Title: "Step 2", DependsOn: []string{"step-1"}},
+		}
+
+		compose := &ComposeRules{
+			Expand: []*ExpandRule{
+				{Target: "step-1", With: "two-step-expansion"},
+				{Target: "step-2", With: "two-step-expansion"},
+			},
+		}
+
+		result, err := ApplyExpansions(steps, compose, parser)
+		if err != nil {
+			t.Fatalf("ApplyExpansions failed: %v", err)
+		}
+
+		// step-2.sub-a must depend on step-1.sub-b via DependsOn
+		step2SubA := result[2]
+		if len(step2SubA.DependsOn) != 1 || step2SubA.DependsOn[0] != "step-1.sub-b" {
+			t.Errorf("step-2.sub-a.DependsOn = %v, want [step-1.sub-b]", step2SubA.DependsOn)
+		}
+	})
+
+	t.Run("non-expanded step after expanded step gets deps rewritten", func(t *testing.T) {
+		// Verify that non-expanded steps still get their refs rewritten (existing behavior)
+		steps := []*Step{
+			{ID: "step-1", Title: "Step 1"},
+			{ID: "step-2", Title: "Step 2", Needs: []string{"step-1"}},
+		}
+
+		compose := &ComposeRules{
+			Expand: []*ExpandRule{
+				{Target: "step-1", With: "two-step-expansion"},
+				// step-2 is NOT expanded
+			},
+		}
+
+		result, err := ApplyExpansions(steps, compose, parser)
+		if err != nil {
+			t.Fatalf("ApplyExpansions failed: %v", err)
+		}
+
+		if len(result) != 3 {
+			t.Fatalf("expected 3 steps, got %d", len(result))
+		}
+
+		// step-2 (non-expanded) should now need step-1.sub-b
+		if len(result[2].Needs) != 1 || result[2].Needs[0] != "step-1.sub-b" {
+			t.Errorf("step-2.Needs = %v, want [step-1.sub-b]", result[2].Needs)
+		}
+	})
+}
+
+func TestApplyInlineExpansionsCrossExpansionDeps(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	expansion := `{
+		"formula": "inline-exp",
+		"type": "expansion",
+		"version": 1,
+		"template": [
+			{"id": "{target}.first", "title": "First of {target.title}"},
+			{"id": "{target}.second", "title": "Second of {target.title}", "needs": ["{target}.first"]}
+		]
+	}`
+	err := os.WriteFile(filepath.Join(tmpDir, "inline-exp.formula.json"), []byte(expansion), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parser := NewParser(tmpDir)
+
+	t.Run("inline expand preserves needs on expanded step", func(t *testing.T) {
+		steps := []*Step{
+			{ID: "setup", Title: "Setup"},
+			{
+				ID:     "work",
+				Title:  "Work",
+				Needs:  []string{"setup"},
+				Expand: "inline-exp",
+			},
+		}
+
+		result, err := ApplyInlineExpansions(steps, parser)
+		if err != nil {
+			t.Fatalf("ApplyInlineExpansions failed: %v", err)
+		}
+
+		// setup + work.first + work.second = 3
+		if len(result) != 3 {
+			t.Fatalf("expected 3 steps, got %d", len(result))
+		}
+
+		// work.first should inherit the "setup" dependency from the original step
+		workFirst := result[1]
+		if workFirst.ID != "work.first" {
+			t.Fatalf("result[1].ID = %q, want work.first", workFirst.ID)
+		}
+		if len(workFirst.Needs) != 1 || workFirst.Needs[0] != "setup" {
+			t.Errorf("work.first.Needs = %v, want [setup]", workFirst.Needs)
+		}
+
+		// work.second should only need work.first (internal template dep)
+		workSecond := result[2]
+		if len(workSecond.Needs) != 1 || workSecond.Needs[0] != "work.first" {
+			t.Errorf("work.second.Needs = %v, want [work.first]", workSecond.Needs)
+		}
+	})
+}
+
 func TestFindDuplicateStepIDs(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -815,4 +1034,166 @@ func TestFindDuplicateStepIDs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMaterializeExpansion(t *testing.T) {
+	t.Run("rule-of-five style produces correct steps", func(t *testing.T) {
+		f := &Formula{
+			Formula:     "rule-of-five",
+			Description: "Iterative refinement",
+			Type:        TypeExpansion,
+			Template: []*Step{
+				{ID: "{target}.draft", Title: "Draft: {target.title}"},
+				{ID: "{target}.refine-1", Title: "Refine 1", Needs: []string{"{target}.draft"}},
+				{ID: "{target}.refine-2", Title: "Refine 2", Needs: []string{"{target}.refine-1"}},
+				{ID: "{target}.refine-3", Title: "Refine 3", Needs: []string{"{target}.refine-2"}},
+				{ID: "{target}.refine-4", Title: "Refine 4", Needs: []string{"{target}.refine-3"}},
+			},
+		}
+
+		err := MaterializeExpansion(f, "main", nil)
+		if err != nil {
+			t.Fatalf("MaterializeExpansion failed: %v", err)
+		}
+
+		if len(f.Steps) != 5 {
+			t.Fatalf("expected 5 steps, got %d", len(f.Steps))
+		}
+
+		expectedIDs := []string{"main.draft", "main.refine-1", "main.refine-2", "main.refine-3", "main.refine-4"}
+		for i, exp := range expectedIDs {
+			if f.Steps[i].ID != exp {
+				t.Errorf("Steps[%d].ID = %q, want %q", i, f.Steps[i].ID, exp)
+			}
+		}
+
+		// First step title uses {target.title} -> formula name
+		if f.Steps[0].Title != "Draft: rule-of-five" {
+			t.Errorf("Steps[0].Title = %q, want %q", f.Steps[0].Title, "Draft: rule-of-five")
+		}
+
+		// Needs chain resolved
+		if len(f.Steps[1].Needs) != 1 || f.Steps[1].Needs[0] != "main.draft" {
+			t.Errorf("Steps[1].Needs = %v, want [main.draft]", f.Steps[1].Needs)
+		}
+		if len(f.Steps[4].Needs) != 1 || f.Steps[4].Needs[0] != "main.refine-3" {
+			t.Errorf("Steps[4].Needs = %v, want [main.refine-3]", f.Steps[4].Needs)
+		}
+	})
+
+	t.Run("no-op for workflow formula", func(t *testing.T) {
+		f := &Formula{
+			Formula: "shiny",
+			Type:    TypeWorkflow,
+			Steps:   []*Step{{ID: "design", Title: "Design"}},
+			Template: []*Step{
+				{ID: "{target}.draft", Title: "Draft"},
+			},
+		}
+
+		err := MaterializeExpansion(f, "main", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Steps unchanged
+		if len(f.Steps) != 1 || f.Steps[0].ID != "design" {
+			t.Errorf("Steps should be unchanged, got %v", getChildIDs(f.Steps))
+		}
+	})
+
+	t.Run("no-op for expansion with existing steps", func(t *testing.T) {
+		f := &Formula{
+			Formula: "already-materialized",
+			Type:    TypeExpansion,
+			Steps:   []*Step{{ID: "existing", Title: "Already here"}},
+			Template: []*Step{
+				{ID: "{target}.draft", Title: "Draft"},
+			},
+		}
+
+		err := MaterializeExpansion(f, "main", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Steps unchanged
+		if len(f.Steps) != 1 || f.Steps[0].ID != "existing" {
+			t.Errorf("Steps should be unchanged, got %v", getChildIDs(f.Steps))
+		}
+	})
+
+	t.Run("no-op for expansion with empty template", func(t *testing.T) {
+		f := &Formula{
+			Formula:  "empty-expansion",
+			Type:     TypeExpansion,
+			Template: []*Step{},
+		}
+
+		err := MaterializeExpansion(f, "main", nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(f.Steps) != 0 {
+			t.Errorf("expected 0 steps, got %d", len(f.Steps))
+		}
+	})
+
+	t.Run("single-brace vars substituted", func(t *testing.T) {
+		f := &Formula{
+			Formula: "env-deploy",
+			Type:    TypeExpansion,
+			Template: []*Step{
+				{ID: "{target}.prepare-{env}", Title: "Prepare {env}"},
+				{ID: "{target}.deploy-{env}", Title: "Deploy to {env}", Needs: []string{"{target}.prepare-{env}"}},
+			},
+		}
+
+		vars := map[string]string{"env": "production"}
+		err := MaterializeExpansion(f, "main", vars)
+		if err != nil {
+			t.Fatalf("MaterializeExpansion failed: %v", err)
+		}
+
+		if len(f.Steps) != 2 {
+			t.Fatalf("expected 2 steps, got %d", len(f.Steps))
+		}
+
+		if f.Steps[0].ID != "main.prepare-production" {
+			t.Errorf("Steps[0].ID = %q, want %q", f.Steps[0].ID, "main.prepare-production")
+		}
+		if f.Steps[1].ID != "main.deploy-production" {
+			t.Errorf("Steps[1].ID = %q, want %q", f.Steps[1].ID, "main.deploy-production")
+		}
+		if f.Steps[1].Needs[0] != "main.prepare-production" {
+			t.Errorf("Steps[1].Needs[0] = %q, want %q", f.Steps[1].Needs[0], "main.prepare-production")
+		}
+	})
+
+	t.Run("double-brace vars pass through untouched", func(t *testing.T) {
+		f := &Formula{
+			Formula: "with-workflow-vars",
+			Type:    TypeExpansion,
+			Template: []*Step{
+				{
+					ID:          "{target}.work",
+					Title:       "Work on {{feature}}",
+					Description: "Build {{feature}} with brief: {{brief}}",
+				},
+			},
+		}
+
+		err := MaterializeExpansion(f, "main", nil)
+		if err != nil {
+			t.Fatalf("MaterializeExpansion failed: %v", err)
+		}
+
+		if f.Steps[0].Title != "Work on {{feature}}" {
+			t.Errorf("Title = %q, want %q (double-brace should be preserved)", f.Steps[0].Title, "Work on {{feature}}")
+		}
+		if f.Steps[0].Description != "Build {{feature}} with brief: {{brief}}" {
+			t.Errorf("Description = %q, want double-brace vars preserved", f.Steps[0].Description)
+		}
+	})
 }

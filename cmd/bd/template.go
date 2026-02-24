@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -51,6 +50,11 @@ type CloneOptions struct {
 	// Dynamic bonding fields (for Christmas Ornament pattern)
 	ParentID string // Parent molecule ID to bond under (e.g., "patrol-x7k")
 	ChildRef string // Child reference with variables (e.g., "arm-{{polecat_name}}")
+
+	// Atomic attachment: if set, adds a dependency from the spawned root to
+	// AttachToID within the same transaction as the clone, preventing orphans.
+	AttachToID    string               // Molecule ID to attach spawned root to
+	AttachDepType types.DependencyType // Dependency type for the attachment
 }
 
 // bondedIDPattern validates bonded IDs (alphanumeric, dash, underscore, dot)
@@ -87,12 +91,10 @@ var templateListCmd = &cobra.Command{
 			var err error
 			beadsTemplates, err = store.GetIssuesByLabel(ctx, BeadsTemplateLabel)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading templates: %v\n", err)
-				os.Exit(1)
+				FatalError("loading templates: %v", err)
 			}
 		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
+			FatalError("no database connection")
 		}
 
 		if jsonOutput {
@@ -136,12 +138,10 @@ var templateShowCmd = &cobra.Command{
 			var err error
 			templateID, err = utils.ResolvePartialID(ctx, store, args[0])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: template '%s' not found\n", args[0])
-				os.Exit(1)
+				FatalError("template '%s' not found", args[0])
 			}
 		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
+			FatalError("no database connection")
 		}
 
 		// Load and show Beads template
@@ -149,8 +149,7 @@ var templateShowCmd = &cobra.Command{
 		var err error
 		subgraph, err = loadTemplateSubgraph(ctx, store, templateID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading template: %v\n", err)
-			os.Exit(1)
+			FatalError("loading template: %v", err)
 		}
 
 		showBeadsTemplate(subgraph)
@@ -212,8 +211,7 @@ Example:
 		for _, v := range varFlags {
 			parts := strings.SplitN(v, "=", 2)
 			if len(parts) != 2 {
-				fmt.Fprintf(os.Stderr, "Error: invalid variable format '%s', expected 'key=value'\n", v)
-				os.Exit(1)
+				FatalError("invalid variable format '%s', expected 'key=value'", v)
 			}
 			vars[parts[0]] = parts[1]
 		}
@@ -224,12 +222,10 @@ Example:
 			var err error
 			templateID, err = utils.ResolvePartialID(ctx, store, args[0])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving template ID %s: %v\n", args[0], err)
-				os.Exit(1)
+				FatalError("resolving template ID %s: %v", args[0], err)
 			}
 		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
+			FatalError("no database connection")
 		}
 
 		// Load the template subgraph
@@ -237,8 +233,7 @@ Example:
 		var err error
 		subgraph, err = loadTemplateSubgraph(ctx, store, templateID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading template: %v\n", err)
-			os.Exit(1)
+			FatalError("loading template: %v", err)
 		}
 
 		// Check for missing variables
@@ -250,9 +245,10 @@ Example:
 			}
 		}
 		if len(missingVars) > 0 {
-			fmt.Fprintf(os.Stderr, "Error: missing required variables: %s\n", strings.Join(missingVars, ", "))
-			fmt.Fprintf(os.Stderr, "Provide them with: --var %s=<value>\n", missingVars[0])
-			os.Exit(1)
+			FatalErrorWithHint(
+				fmt.Sprintf("missing required variables: %s", strings.Join(missingVars, ", ")),
+				fmt.Sprintf("Provide them with: --var %s=<value>", missingVars[0]),
+			)
 		}
 
 		if dryRun {
@@ -285,8 +281,7 @@ Example:
 		var result *InstantiateResult
 		result, err = cloneSubgraph(ctx, store, subgraph, opts)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error instantiating template: %v\n", err)
-			os.Exit(1)
+			FatalError("instantiating template: %v", err)
 		}
 
 		if jsonOutput {
@@ -725,7 +720,7 @@ func cloneSubgraph(ctx context.Context, s *dolt.DoltStore, subgraph *TemplateSub
 	idMapping := make(map[string]string)
 
 	// Use transaction for atomicity
-	err := s.RunInTransaction(ctx, func(tx storage.Transaction) error {
+	err := transact(ctx, s, "bd: clone template subgraph", func(tx storage.Transaction) error {
 		// First pass: create all issues with new IDs
 		for _, oldIssue := range subgraph.Issues {
 			// Determine assignee: use override for root epic, otherwise keep template's
@@ -787,6 +782,19 @@ func cloneSubgraph(ctx context.Context, s *dolt.DoltStore, subgraph *TemplateSub
 			}
 			if err := tx.AddDependency(ctx, newDep, opts.Actor); err != nil {
 				return fmt.Errorf("failed to create dependency: %w", err)
+			}
+		}
+
+		// Atomic attachment: link spawned root to target molecule within
+		// the same transaction (bd-wvplu: prevents orphaned spawns)
+		if opts.AttachToID != "" {
+			attachDep := &types.Dependency{
+				IssueID:     idMapping[subgraph.Root.ID],
+				DependsOnID: opts.AttachToID,
+				Type:        opts.AttachDepType,
+			}
+			if err := tx.AddDependency(ctx, attachDep, opts.Actor); err != nil {
+				return fmt.Errorf("attaching to molecule: %w", err)
 			}
 		}
 

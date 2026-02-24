@@ -210,6 +210,38 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "0.56.1",
+		Date:    "2026-02-23",
+		Changes: []string{
+			"FIX: Release CI — remove verify-cgo hook from CGO_ENABLED=0 builds (darwin, freebsd)",
+		},
+	},
+	{
+		Version: "0.56.0",
+		Date:    "2026-02-23",
+		Changes: []string{
+			"REMOVED: Embedded Dolt mode — server-only; binary 168MB → 41MB",
+			"REMOVED: SQLite ephemeral store — wisps now in Dolt-backed table",
+			"REMOVED: JSONL sync pipeline — Dolt-native push/pull only",
+			"NEW: OpenTelemetry opt-in instrumentation for hooks and storage",
+			"NEW: Transaction infrastructure with isolation, retry, and batch wrapping",
+			"NEW: Metadata query support in bd list, bd search, bd query",
+			"FIX: Atomic bond/squash/cook operations (single transaction)",
+			"FIX: Double JSON encoding in daemon-mode RPC calls",
+			"FIX: bd ready parent filter and blocked status propagation",
+			"PERF: Test isolation from production Dolt server",
+		},
+	},
+	{
+		Version: "0.55.4",
+		Date:    "2026-02-20",
+		Changes: []string{
+			"FIX: Release CI FreeBSD — CGO_ENABLED=0 (zig sysroot lacks stdlib.h)",
+			"FIX: Release CI macOS — CGO_ENABLED=0 for darwin (zig sysroot lacks frameworks)",
+			"FIX: Release CI libresolv — strip -lresolv from zig wrappers (macOS uses netgo)",
+		},
+	},
+	{
 		Version: "0.55.1",
 		Date:    "2026-02-20",
 		Changes: []string{
@@ -232,9 +264,10 @@ var versionChanges = []VersionChange{
 		Version: "0.54.0",
 		Date:    "2026-02-18",
 		Changes: []string{
+			"FIX: mol squash auto-closes wisp root to prevent Dolt lock errors",
 			"FIX: Release CI zig cross-compilation cache race (--parallelism 1)",
 			"FIX: Android ARM64 build uses CGO_ENABLED=0 (server mode only)",
-			"FIX: macOS cross-builds use netgo tag with zig 0.14.0",
+			"NEW: Mux setup recipe with layered AGENTS and managed hooks",
 		},
 	},
 	{

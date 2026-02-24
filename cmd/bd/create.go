@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/routing"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
@@ -420,12 +422,12 @@ var createCmd = &cobra.Command{
 		if parentID != "" {
 			ctx := rootCtx
 			// Validate parent exists before generating child ID
-			parentIssue, err := store.GetIssue(ctx, parentID)
+			_, err := store.GetIssue(ctx, parentID)
 			if err != nil {
+				if errors.Is(err, storage.ErrNotFound) {
+					FatalError("parent issue %s not found", parentID)
+				}
 				FatalError("failed to check parent issue: %v", err)
-			}
-			if parentIssue == nil {
-				FatalError("parent issue %s not found", parentID)
 			}
 			childID, err := store.GetNextChildID(ctx, parentID)
 			if err != nil {
@@ -538,6 +540,12 @@ var createCmd = &cobra.Command{
 			FatalError("%v", err)
 		}
 
+		// Track whether any post-create writes occurred. CreateIssue commits
+		// the issue to Dolt internally, but subsequent AddDependency/AddLabel
+		// calls only write to the working set. A follow-up Dolt commit is
+		// needed to persist them (GH#2009).
+		postCreateWrites := false
+
 		// If parent was specified, add parent-child dependency
 		if parentID != "" {
 			dep := &types.Dependency{
@@ -547,6 +555,8 @@ var createCmd = &cobra.Command{
 			}
 			if err := store.AddDependency(ctx, dep, actor); err != nil {
 				WarnError("failed to add parent-child dependency %s -> %s: %v", issue.ID, parentID, err)
+			} else {
+				postCreateWrites = true
 			}
 		}
 
@@ -554,6 +564,8 @@ var createCmd = &cobra.Command{
 		for _, label := range labels {
 			if err := store.AddLabel(ctx, issue.ID, label, actor); err != nil {
 				WarnError("failed to add label %s: %v", label, err)
+			} else {
+				postCreateWrites = true
 			}
 		}
 
@@ -571,12 +583,16 @@ var createCmd = &cobra.Command{
 				agentLabel := "role_type:" + issue.RoleType
 				if err := store.AddLabel(ctx, issue.ID, agentLabel, actor); err != nil {
 					WarnError("failed to add role_type label: %v", err)
+				} else {
+					postCreateWrites = true
 				}
 			}
 			if issue.Rig != "" {
 				rigLabel := "rig:" + issue.Rig
 				if err := store.AddLabel(ctx, issue.ID, rigLabel, actor); err != nil {
 					WarnError("failed to add rig label: %v", err)
+				} else {
+					postCreateWrites = true
 				}
 			}
 		}
@@ -631,6 +647,8 @@ var createCmd = &cobra.Command{
 			}
 			if err := store.AddDependency(ctx, dep, actor); err != nil {
 				WarnError("failed to add dependency %s -> %s: %v", issue.ID, dependsOnID, err)
+			} else {
+				postCreateWrites = true
 			}
 		}
 
@@ -662,13 +680,32 @@ var createCmd = &cobra.Command{
 			}
 			if err := store.AddDependency(ctx, dep, actor); err != nil {
 				WarnError("failed to add waits-for dependency %s -> %s: %v", issue.ID, waitsFor, err)
+			} else {
+				postCreateWrites = true
 			}
 		}
 
-		// If issue was routed to a different repo, flush its JSONL immediately
-		// so the issue appears in bd list when hydration is enabled (bd-fix-routing)
-		if repoPath != "." {
-			flushRoutedRepo(targetStore, repoPath)
+		// Commit post-create metadata (deps, labels) to Dolt. CreateIssue's
+		// internal DOLT_COMMIT only covers the issue row; AddDependency and
+		// AddLabel write to the SQL working set without a Dolt commit. Without
+		// this, the metadata is visible but not durable — it can be lost on
+		// push, sync, or server restart (GH#2009).
+		if postCreateWrites {
+			commitMsg := fmt.Sprintf("bd: create %s (metadata)", issue.ID)
+			if err := store.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
+				WarnError("failed to commit post-create metadata: %v", err)
+			}
+		}
+
+		// If issue was routed to a different repo, commit+push so other
+		// agents/rigs see the new issue immediately (dolt-native sync).
+		if repoPath != "." && targetStore != nil {
+			if _, err := targetStore.CommitPending(ctx, actor); err != nil {
+				debug.Logf("warning: failed to commit routed repo: %v", err)
+			}
+			if err := targetStore.Push(ctx); err != nil {
+				debug.Logf("warning: failed to push routed repo: %v", err)
+			}
 		}
 
 		// Run create hook
@@ -695,91 +732,6 @@ var createCmd = &cobra.Command{
 	},
 }
 
-// flushRoutedRepo ensures the target repo's JSONL is updated after routing an issue.
-// This is critical for multi-repo hydration to work correctly (bd-fix-routing).
-// Always writes local JSONL as a safety net (even in dolt-native mode).
-func flushRoutedRepo(targetStore *dolt.DoltStore, repoPath string) {
-	ctx := context.Background()
-
-	// Expand the repo path and construct the .beads directory path
-	targetBeadsDir := routing.ExpandPath(repoPath)
-	if !filepath.IsAbs(targetBeadsDir) {
-		// If relative path, make it absolute
-		absPath, err := filepath.Abs(targetBeadsDir)
-		if err != nil {
-			debug.Logf("warning: failed to get absolute path for %s: %v", targetBeadsDir, err)
-			return
-		}
-		targetBeadsDir = absPath
-	}
-
-	// Construct JSONL path
-	beadsDir := filepath.Join(targetBeadsDir, ".beads")
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-
-	debug.Logf("attempting to flush routed repo at %s", targetBeadsDir)
-
-	// Export directly to JSONL
-	issues, err := targetStore.SearchIssues(ctx, "", types.IssueFilter{})
-	if err != nil {
-		WarnError("failed to query issues for export: %v", err)
-		return
-	}
-
-	if err := performAtomicExport(ctx, jsonlPath, issues, targetStore); err != nil {
-		WarnError("failed to export to target repo: %v", err)
-		return
-	}
-
-	debug.Logf("successfully exported to %s", jsonlPath)
-}
-
-// performAtomicExport writes issues to JSONL using atomic temp file + rename
-func performAtomicExport(_ context.Context, jsonlPath string, issues []*types.Issue, _ *dolt.DoltStore) error {
-	// Create temp file with PID suffix for atomic write
-	tempPath := fmt.Sprintf("%s.tmp.%d", jsonlPath, os.Getpid())
-
-	// Ensure we clean up temp file on error
-	defer func() {
-		// Remove temp file if it still exists (rename failed or error occurred)
-		if _, err := os.Stat(tempPath); err == nil {
-			_ = os.Remove(tempPath) // Best effort cleanup of temp file
-		}
-	}()
-
-	// Open temp file for writing
-	tempFile, err := os.Create(tempPath) //nolint:gosec // tempPath is safely constructed from jsonlPath
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-
-	// Write issues as JSONL
-	encoder := json.NewEncoder(tempFile)
-	for _, issue := range issues {
-		if err := encoder.Encode(issue); err != nil {
-			_ = tempFile.Close() // Best effort cleanup
-			return fmt.Errorf("failed to encode issue %s: %w", issue.ID, err)
-		}
-	}
-
-	// Sync to disk before rename
-	if err := tempFile.Sync(); err != nil {
-		_ = tempFile.Close() // Best effort cleanup
-		return fmt.Errorf("failed to sync temp file: %w", err)
-	}
-
-	if err := tempFile.Close(); err != nil {
-		return fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tempPath, jsonlPath); err != nil {
-		return fmt.Errorf("failed to rename temp file: %w", err)
-	}
-
-	return nil
-}
-
 func init() {
 	createCmd.Flags().StringP("file", "f", "", "Create multiple issues from markdown file")
 	createCmd.Flags().String("title", "", "Issue title (alternative to positional argument)")
@@ -802,7 +754,7 @@ func init() {
 	createCmd.Flags().String("rig", "", "Create issue in a different rig (e.g., --rig beads)")
 	createCmd.Flags().String("prefix", "", "Create issue in rig by prefix (e.g., --prefix bd- or --prefix bd or --prefix beads)")
 	createCmd.Flags().IntP("estimate", "e", 0, "Time estimate in minutes (e.g., 60 for 1 hour)")
-	createCmd.Flags().Bool("ephemeral", false, "Create as ephemeral (ephemeral, not exported to JSONL)")
+	createCmd.Flags().Bool("ephemeral", false, "Create as ephemeral (short-lived, subject to TTL compaction)")
 	createCmd.Flags().String("mol-type", "", "Molecule type: swarm (multi-polecat), patrol (recurring ops), work (default)")
 	createCmd.Flags().String("wisp-type", "", "Wisp type for TTL-based compaction: heartbeat, ping, patrol, gc_report, recovery, error, escalation")
 	createCmd.Flags().Bool("validate", false, "Validate description contains required sections for issue type")
@@ -1026,15 +978,6 @@ func ensureBeadsDirForPath(ctx context.Context, targetPath string, sourceStore *
 	// Create .beads directory
 	if err := os.MkdirAll(beadsDir, 0750); err != nil {
 		return fmt.Errorf("cannot create .beads directory: %w", err)
-	}
-
-	// Create issues.jsonl if it doesn't exist
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-	if _, err := os.Stat(jsonlPath); os.IsNotExist(err) {
-		// #nosec G306 -- planning repo JSONL must be shareable across collaborators
-		if err := os.WriteFile(jsonlPath, []byte{}, 0644); err != nil {
-			return fmt.Errorf("failed to create issues.jsonl: %w", err)
-		}
 	}
 
 	// Initialize database - it will be created when dolt.New is called

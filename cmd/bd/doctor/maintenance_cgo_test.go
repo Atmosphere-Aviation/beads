@@ -4,8 +4,11 @@ package doctor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -20,15 +23,27 @@ import (
 // For small counts, uses the store API. For large counts (>100), uses raw SQL bulk insert.
 func setupStaleClosedTestDB(t *testing.T, numClosed int, closedAt time.Time, pinnedIndices map[int]bool, thresholdDays int) string {
 	t.Helper()
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("Dolt not installed, skipping test")
+	}
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.Mkdir(beadsDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
+	// Generate unique database name for test isolation
+	h := sha256.Sum256([]byte(t.Name() + fmt.Sprintf("%d", time.Now().UnixNano())))
+	dbName := "doctest_" + hex.EncodeToString(h[:6])
+	port := doctorTestServerPort()
+
 	cfg := configfile.DefaultConfig()
 	cfg.Backend = configfile.BackendDolt
 	cfg.StaleClosedIssuesDays = thresholdDays
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltServerHost = "127.0.0.1"
+	cfg.DoltServerPort = port
+	cfg.DoltDatabase = dbName
 	if err := cfg.Save(beadsDir); err != nil {
 		t.Fatalf("Failed to save config: %v", err)
 	}
@@ -36,11 +51,17 @@ func setupStaleClosedTestDB(t *testing.T, numClosed int, closedAt time.Time, pin
 	dbPath := filepath.Join(beadsDir, "dolt")
 	ctx := context.Background()
 
-	store, err := dolt.New(ctx, &dolt.Config{Path: dbPath})
+	store, err := dolt.New(ctx, &dolt.Config{
+		Path:       dbPath,
+		ServerHost: "127.0.0.1",
+		ServerPort: port,
+		Database:   dbName,
+	})
 	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	defer store.Close()
+	t.Cleanup(func() { dropDoctorTestDatabase(dbName, port) })
 
 	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
 		t.Fatalf("Failed to set issue_prefix: %v", err)
@@ -133,8 +154,13 @@ func TestCheckStaleClosedIssues_DisabledSmallCount(t *testing.T) {
 	}
 }
 
-// Test #3: Disabled (threshold=0), large closed count (≥10k) → warning
+// Test #3: Disabled (threshold=0), large closed count (≥threshold) → warning
 func TestCheckStaleClosedIssues_DisabledLargeCount(t *testing.T) {
+	// Override threshold to avoid inserting 10k rows (saves ~50s).
+	orig := largeClosedIssuesThreshold
+	largeClosedIssuesThreshold = 100
+	t.Cleanup(func() { largeClosedIssuesThreshold = orig })
+
 	tmpDir := setupStaleClosedTestDB(t, largeClosedIssuesThreshold, time.Now().AddDate(0, 0, -60), nil, 0)
 
 	check := CheckStaleClosedIssues(tmpDir)

@@ -15,6 +15,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -26,12 +27,12 @@ import (
 type storageExecutor func(store *dolt.DoltStore) error
 
 // withStorage executes an operation with either the direct store or a read-only store in daemon mode
-func withStorage(ctx context.Context, store *dolt.DoltStore, dbPath string, lockTimeout time.Duration, fn storageExecutor) error {
+func withStorage(ctx context.Context, store *dolt.DoltStore, dbPath string, fn storageExecutor) error {
 	if store != nil {
 		return fn(store)
 	} else if dbPath != "" {
 		// Daemon mode: open read-only connection
-		roStore, err := dolt.New(ctx, &dolt.Config{Path: dbPath, ReadOnly: true, OpenTimeout: lockTimeout})
+		roStore, err := dolt.New(ctx, &dolt.Config{Path: dbPath, ReadOnly: true})
 		if err != nil {
 			return err
 		}
@@ -42,10 +43,10 @@ func withStorage(ctx context.Context, store *dolt.DoltStore, dbPath string, lock
 }
 
 // getHierarchicalChildren handles the --tree --parent combination logic
-func getHierarchicalChildren(ctx context.Context, store *dolt.DoltStore, dbPath string, lockTimeout time.Duration, parentID string) ([]*types.Issue, error) {
+func getHierarchicalChildren(ctx context.Context, store *dolt.DoltStore, dbPath string, parentID string) ([]*types.Issue, error) {
 	// First verify that the parent issue exists
 	var parentIssue *types.Issue
-	err := withStorage(ctx, store, dbPath, lockTimeout, func(s *dolt.DoltStore) error {
+	err := withStorage(ctx, store, dbPath, func(s *dolt.DoltStore) error {
 		var err error
 		parentIssue, err = s.GetIssue(ctx, parentID)
 		return err
@@ -65,7 +66,7 @@ func getHierarchicalChildren(ctx context.Context, store *dolt.DoltStore, dbPath 
 	allDescendants[parentID] = parentIssue
 
 	// Recursively find all descendants
-	err = findAllDescendants(ctx, store, dbPath, lockTimeout, parentID, allDescendants, 0, 10) // max depth 10
+	err = findAllDescendants(ctx, store, dbPath, parentID, allDescendants, 0, 10) // max depth 10
 	if err != nil {
 		return nil, fmt.Errorf("error finding descendants: %v", err)
 	}
@@ -80,14 +81,14 @@ func getHierarchicalChildren(ctx context.Context, store *dolt.DoltStore, dbPath 
 }
 
 // findAllDescendants recursively finds all descendants using parent filtering
-func findAllDescendants(ctx context.Context, store *dolt.DoltStore, dbPath string, lockTimeout time.Duration, parentID string, result map[string]*types.Issue, currentDepth, maxDepth int) error {
+func findAllDescendants(ctx context.Context, store *dolt.DoltStore, dbPath string, parentID string, result map[string]*types.Issue, currentDepth, maxDepth int) error {
 	if currentDepth >= maxDepth {
 		return nil // Prevent infinite recursion
 	}
 
 	// Get direct children using the same filter logic as regular --parent
 	var children []*types.Issue
-	err := withStorage(ctx, store, dbPath, lockTimeout, func(s *dolt.DoltStore) error {
+	err := withStorage(ctx, store, dbPath, func(s *dolt.DoltStore) error {
 		filter := types.IssueFilter{
 			ParentID: &parentID,
 		}
@@ -104,7 +105,7 @@ func findAllDescendants(ctx context.Context, store *dolt.DoltStore, dbPath strin
 		if _, exists := result[child.ID]; !exists {
 			result[child.ID] = child
 			// Recursively find this child's descendants
-			err = findAllDescendants(ctx, store, dbPath, lockTimeout, child.ID, result, currentDepth+1, maxDepth)
+			err = findAllDescendants(ctx, store, dbPath, child.ID, result, currentDepth+1, maxDepth)
 			if err != nil {
 				return err
 			}
@@ -315,8 +316,7 @@ var listCmd = &cobra.Command{
 		if molTypeStr != "" {
 			mt := types.MolType(molTypeStr)
 			if !mt.IsValid() {
-				fmt.Fprintf(os.Stderr, "Error: invalid mol-type %q (must be swarm, patrol, or work)\n", molTypeStr)
-				os.Exit(1)
+				FatalError("invalid mol-type %q (must be swarm, patrol, or work)", molTypeStr)
 			}
 			molType = &mt
 		}
@@ -327,8 +327,7 @@ var listCmd = &cobra.Command{
 		if wispTypeStr != "" {
 			wt := types.WispType(wispTypeStr)
 			if !wt.IsValid() {
-				fmt.Fprintf(os.Stderr, "Error: invalid wisp-type %q (must be heartbeat, ping, patrol, gc_report, recovery, error, or escalation)\n", wispTypeStr)
-				os.Exit(1)
+				FatalError("invalid wisp-type %q (must be heartbeat, ping, patrol, gc_report, recovery, error, or escalation)", wispTypeStr)
 			}
 			wispType = &wt
 		}
@@ -371,21 +370,32 @@ var listCmd = &cobra.Command{
 			}
 		}
 
-		// Handle limit: --limit 0 means unlimited (explicit override)
-		// Otherwise use the value (default 50 or user-specified)
-		// Agent mode uses lower default (20) for context efficiency
-		// --all without explicit --limit sets unlimited (bd-u0l9f)
+		// Resolve effective limit. Priority order:
+		// 1. Explicit --limit always wins (user intent is clear)
+		// 2. --all implies unlimited when --limit is not set (GH#1840)
+		// 3. Agent mode uses a lower default for context efficiency
+		// 4. Default limit (50) otherwise
+		limitChanged := cmd.Flags().Changed("limit")
 		effectiveLimit := limit
-		if cmd.Flags().Changed("limit") && limit == 0 {
-			effectiveLimit = 0 // Explicit unlimited
-		} else if !cmd.Flags().Changed("limit") && allFlag {
-			effectiveLimit = 0 // --all implies unlimited
-		} else if !cmd.Flags().Changed("limit") && ui.IsAgentMode() {
+		switch {
+		case limitChanged:
+			effectiveLimit = limit // Explicit value (including --limit 0 for unlimited)
+		case allFlag:
+			effectiveLimit = 0 // --all implies unlimited regardless of other flags
+		case ui.IsAgentMode():
 			effectiveLimit = 20 // Agent mode default
 		}
 
+		// When --sort is specified, don't pass Limit to SQL — the hardcoded
+		// ORDER BY would truncate before Go-side sorting (GH#1237).
+		// Instead, apply limit in Go after sortIssues().
+		sqlLimit := effectiveLimit
+		if sortBy != "" {
+			sqlLimit = 0
+		}
+
 		filter := types.IssueFilter{
-			Limit: effectiveLimit,
+			Limit: sqlLimit,
 		}
 
 		// --ready flag: show only open issues (excludes hooked/in_progress/blocked/deferred) (bd-ihu31)
@@ -406,8 +416,7 @@ var listCmd = &cobra.Command{
 			priorityStr, _ := cmd.Flags().GetString("priority")
 			priority, err := validation.ValidatePriority(priorityStr)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 			filter.Priority = &priority
 		}
@@ -458,48 +467,42 @@ var listCmd = &cobra.Command{
 		if createdAfter != "" {
 			t, err := parseTimeFlag(createdAfter)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --created-after: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --created-after: %v", err)
 			}
 			filter.CreatedAfter = &t
 		}
 		if createdBefore != "" {
 			t, err := parseTimeFlag(createdBefore)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --created-before: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --created-before: %v", err)
 			}
 			filter.CreatedBefore = &t
 		}
 		if updatedAfter != "" {
 			t, err := parseTimeFlag(updatedAfter)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --updated-after: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --updated-after: %v", err)
 			}
 			filter.UpdatedAfter = &t
 		}
 		if updatedBefore != "" {
 			t, err := parseTimeFlag(updatedBefore)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --updated-before: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --updated-before: %v", err)
 			}
 			filter.UpdatedBefore = &t
 		}
 		if closedAfter != "" {
 			t, err := parseTimeFlag(closedAfter)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --closed-after: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --closed-after: %v", err)
 			}
 			filter.ClosedAfter = &t
 		}
 		if closedBefore != "" {
 			t, err := parseTimeFlag(closedBefore)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --closed-before: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --closed-before: %v", err)
 			}
 			filter.ClosedBefore = &t
 		}
@@ -519,24 +522,21 @@ var listCmd = &cobra.Command{
 		if cmd.Flags().Changed("priority-min") {
 			priorityMin, err := validation.ValidatePriority(priorityMinStr)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --priority-min: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --priority-min: %v", err)
 			}
 			filter.PriorityMin = &priorityMin
 		}
 		if cmd.Flags().Changed("priority-max") {
 			priorityMax, err := validation.ValidatePriority(priorityMaxStr)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --priority-max: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --priority-max: %v", err)
 			}
 			filter.PriorityMax = &priorityMax
 		}
 
 		// Pinned filtering: --pinned and --no-pinned are mutually exclusive
 		if pinnedFlag && noPinnedFlag {
-			fmt.Fprintf(os.Stderr, "Error: --pinned and --no-pinned are mutually exclusive\n")
-			os.Exit(1)
+			FatalError("--pinned and --no-pinned are mutually exclusive")
 		}
 		if pinnedFlag {
 			pinned := true
@@ -561,8 +561,7 @@ var listCmd = &cobra.Command{
 
 		// Parent filtering: filter children by parent issue
 		if parentID != "" && noParent {
-			fmt.Fprintf(os.Stderr, "Error: --parent and --no-parent are mutually exclusive\n")
-			os.Exit(1)
+			FatalError("--parent and --no-parent are mutually exclusive")
 		}
 		if parentID != "" {
 			filter.ParentID = &parentID
@@ -588,37 +587,56 @@ var listCmd = &cobra.Command{
 		if deferAfter != "" {
 			t, err := parseTimeFlag(deferAfter)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --defer-after: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --defer-after: %v", err)
 			}
 			filter.DeferAfter = &t
 		}
 		if deferBefore != "" {
 			t, err := parseTimeFlag(deferBefore)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --defer-before: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --defer-before: %v", err)
 			}
 			filter.DeferBefore = &t
 		}
 		if dueAfter != "" {
 			t, err := parseTimeFlag(dueAfter)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --due-after: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --due-after: %v", err)
 			}
 			filter.DueAfter = &t
 		}
 		if dueBefore != "" {
 			t, err := parseTimeFlag(dueBefore)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing --due-before: %v\n", err)
-				os.Exit(1)
+				FatalError("parsing --due-before: %v", err)
 			}
 			filter.DueBefore = &t
 		}
 		if overdueFlag {
 			filter.Overdue = true
+		}
+
+		// Metadata filters (GH#1406)
+		metadataFieldFlags, _ := cmd.Flags().GetStringArray("metadata-field")
+		if len(metadataFieldFlags) > 0 {
+			filter.MetadataFields = make(map[string]string, len(metadataFieldFlags))
+			for _, mf := range metadataFieldFlags {
+				k, v, ok := strings.Cut(mf, "=")
+				if !ok || k == "" {
+					FatalErrorRespectJSON("invalid --metadata-field: expected key=value, got %q", mf)
+				}
+				if err := storage.ValidateMetadataKey(k); err != nil {
+					FatalErrorRespectJSON("invalid --metadata-field key: %v", err)
+				}
+				filter.MetadataFields[k] = v
+			}
+		}
+		hasMetadataKey, _ := cmd.Flags().GetString("has-metadata-key")
+		if hasMetadataKey != "" {
+			if err := storage.ValidateMetadataKey(hasMetadataKey); err != nil {
+				FatalErrorRespectJSON("invalid --has-metadata-key: %v", err)
+			}
+			filter.HasMetadataKey = hasMetadataKey
 		}
 
 		ctx := rootCtx
@@ -629,8 +647,7 @@ var listCmd = &cobra.Command{
 		if rigOverride != "" {
 			rigStore, err := openStoreForRig(ctx, rigOverride)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 			defer func() { _ = rigStore.Close() }() // Best effort cleanup
 			activeStore = rigStore
@@ -639,12 +656,16 @@ var listCmd = &cobra.Command{
 		// Direct mode
 		issues, err := activeStore.SearchIssues(ctx, "", filter)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 
 		// Apply sorting
 		sortIssues(issues, sortBy, reverse)
+
+		// Apply limit after sorting when --sort deferred it from SQL (GH#1237)
+		if sortBy != "" && effectiveLimit > 0 && len(issues) > effectiveLimit {
+			issues = issues[:effectiveLimit]
+		}
 
 		// Handle watch mode (GH#654) - must be before other output modes
 		if watchMode {
@@ -656,10 +677,9 @@ var listCmd = &cobra.Command{
 		if prettyFormat {
 			// Special handling for --tree --parent combination (hierarchical descendants)
 			if parentID != "" {
-				treeIssues, err := getHierarchicalChildren(ctx, activeStore, "", 0, parentID)
+				treeIssues, err := getHierarchicalChildren(ctx, activeStore, "", parentID)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					FatalError("%v", err)
 				}
 
 				if len(treeIssues) == 0 {
@@ -689,8 +709,7 @@ var listCmd = &cobra.Command{
 		// Handle format flag
 		if formatStr != "" {
 			if err := outputFormattedList(ctx, activeStore, issues, formatStr); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				FatalError("%v", err)
 			}
 			return
 		}
@@ -713,18 +732,27 @@ var listCmd = &cobra.Command{
 				issue.Dependencies = allDeps[issue.ID]
 			}
 
-			// Build response with counts
+			// Build response with counts + computed parent (bd-ym8c)
 			issuesWithCounts := make([]*types.IssueWithCounts, len(issues))
 			for i, issue := range issues {
 				counts := depCounts[issue.ID]
 				if counts == nil {
 					counts = &types.DependencyCounts{DependencyCount: 0, DependentCount: 0}
 				}
+				// Compute parent from dependency records
+				var parent *string
+				for _, dep := range allDeps[issue.ID] {
+					if dep.Type == types.DepParentChild {
+						parent = &dep.DependsOnID
+						break
+					}
+				}
 				issuesWithCounts[i] = &types.IssueWithCounts{
 					Issue:           issue,
 					DependencyCount: counts.DependencyCount,
 					DependentCount:  counts.DependentCount,
 					CommentCount:    commentCounts[issue.ID],
+					Parent:          parent,
 				}
 			}
 			outputJSON(issuesWithCounts)
@@ -746,14 +774,14 @@ var listCmd = &cobra.Command{
 		// Previously loaded ALL dependency records which was O(total_issues) and took 2-4s.
 		// Now scoped to only the displayed issues, making it O(displayed_issues).
 		// Best effort: display gracefully degrades with empty data
-		blockedByMap, blocksMap, _ := activeStore.GetBlockingInfoForIssues(ctx, issueIDs)
+		blockedByMap, blocksMap, parentMap, _ := activeStore.GetBlockingInfoForIssues(ctx, issueIDs)
 
 		// Build output in buffer for pager support (bd-jdz3)
 		var buf strings.Builder
 		if ui.IsAgentMode() {
 			// Agent mode: ultra-compact, no colors, no pager
 			for _, issue := range issues {
-				formatAgentIssue(&buf, issue, blockedByMap[issue.ID], blocksMap[issue.ID])
+				formatAgentIssue(&buf, issue, blockedByMap[issue.ID], blocksMap[issue.ID], parentMap[issue.ID])
 			}
 			fmt.Print(buf.String())
 			return
@@ -768,7 +796,7 @@ var listCmd = &cobra.Command{
 			// Compact format: one line per issue
 			for _, issue := range issues {
 				labels := labelsMap[issue.ID]
-				formatIssueCompact(&buf, issue, labels, blockedByMap[issue.ID], blocksMap[issue.ID])
+				formatIssueCompact(&buf, issue, labels, blockedByMap[issue.ID], blocksMap[issue.ID], parentMap[issue.ID])
 			}
 		}
 
@@ -790,7 +818,7 @@ var listCmd = &cobra.Command{
 }
 
 func init() {
-	listCmd.Flags().StringP("status", "s", "", "Filter by status (open, in_progress, blocked, deferred, closed)")
+	listCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Note: dependency-blocked issues use 'bd blocked'")
 	registerPriorityFlag(listCmd, "")
 	listCmd.Flags().StringP("assignee", "a", "", "Filter by assignee")
 	listCmd.Flags().StringP("type", "t", "", "Filter by type (bug, feature, task, epic, chore, decision, merge-request, molecule, gate, convoy). Aliases: mr→merge-request, feat→feature, mol→molecule, dec/adr→decision")
@@ -864,6 +892,10 @@ func init() {
 	listCmd.Flags().Bool("pretty", false, "Display issues in a tree format with status/priority symbols")
 	listCmd.Flags().Bool("tree", false, "Alias for --pretty: hierarchical tree format")
 	listCmd.Flags().BoolP("watch", "w", false, "Watch for changes and auto-update display (implies --pretty)")
+
+	// Metadata filtering (GH#1406)
+	listCmd.Flags().StringArray("metadata-field", nil, "Filter by metadata field (key=value, repeatable)")
+	listCmd.Flags().String("has-metadata-key", "", "Filter issues that have this metadata key set")
 
 	// Pager control (bd-jdz3)
 	listCmd.Flags().Bool("no-pager", false, "Disable pager output")

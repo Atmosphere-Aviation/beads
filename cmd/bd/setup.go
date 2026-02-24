@@ -14,6 +14,7 @@ import (
 
 var (
 	setupProject bool
+	setupGlobal  bool
 	setupCheck   bool
 	setupRemove  bool
 	setupStealth bool
@@ -30,10 +31,13 @@ var setupCmd = &cobra.Command{
 	Long: `Setup integration files for AI editors and coding assistants.
 
 Recipes define where beads workflow instructions are written. Built-in recipes
-include cursor, claude, gemini, aider, factory, codex, windsurf, cody, and kilocode.
+include cursor, claude, gemini, aider, factory, codex, mux, junie, windsurf, cody, and kilocode.
 
 Examples:
   bd setup cursor          # Install Cursor IDE integration
+  bd setup mux --project   # Install Mux workspace layer (.mux/AGENTS.md)
+  bd setup mux --global    # Install Mux global layer (~/.mux/AGENTS.md)
+  bd setup mux --project --global  # Install both Mux layers
   bd setup --list          # Show all available recipes
   bd setup --print         # Print the template to stdout
   bd setup -o rules.md     # Write template to custom path
@@ -61,8 +65,7 @@ func runSetup(cmd *cobra.Command, args []string) {
 	// Handle -o flag (write to arbitrary path)
 	if setupOutput != "" {
 		if err := writeToPath(setupOutput); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		fmt.Printf("✓ Wrote template to %s\n", setupOutput)
 		return
@@ -71,13 +74,10 @@ func runSetup(cmd *cobra.Command, args []string) {
 	// Handle --add flag (save custom recipe)
 	if setupAdd != "" {
 		if len(args) != 1 {
-			fmt.Fprintln(os.Stderr, "Error: --add requires a path argument")
-			fmt.Fprintln(os.Stderr, "Usage: bd setup --add <name> <path>")
-			os.Exit(1)
+			FatalErrorWithHint("--add requires a path argument", "Usage: bd setup --add <name> <path>")
 		}
 		if err := addRecipe(setupAdd, args[0]); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		return
 	}
@@ -96,8 +96,7 @@ func listRecipes() {
 	beadsDir := findBeadsDir()
 	allRecipes, err := recipes.GetAllRecipes(beadsDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading recipes: %v\n", err)
-		os.Exit(1)
+		FatalError("loading recipes: %v", err)
 	}
 
 	// Sort recipe names
@@ -169,6 +168,9 @@ func runRecipe(name string) {
 	case "codex":
 		runCodexRecipe()
 		return
+	case "mux":
+		runMuxRecipe()
+		return
 	case "aider":
 		runAiderRecipe()
 		return
@@ -184,14 +186,11 @@ func runRecipe(name string) {
 	beadsDir := findBeadsDir()
 	recipe, err := recipes.GetRecipe(name, beadsDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		fmt.Fprintln(os.Stderr, "Use 'bd setup --list' to see available recipes.")
-		os.Exit(1)
+		FatalErrorWithHint(fmt.Sprintf("%v", err), "Use 'bd setup --list' to see available recipes.")
 	}
 
 	if recipe.Type != recipes.TypeFile {
-		fmt.Fprintf(os.Stderr, "Error: recipe '%s' has type '%s' which requires special handling\n", name, recipe.Type)
-		os.Exit(1)
+		FatalError("recipe '%s' has type '%s' which requires special handling", name, recipe.Type)
 	}
 
 	// Handle --check
@@ -212,8 +211,7 @@ func runRecipe(name string) {
 				fmt.Println("No integration file found")
 				return
 			}
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			FatalError("%v", err)
 		}
 		fmt.Printf("✓ Removed %s integration\n", recipe.Name)
 		return
@@ -226,14 +224,12 @@ func runRecipe(name string) {
 	dir := filepath.Dir(recipe.Path)
 	if dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: create directory: %v\n", err)
-			os.Exit(1)
+			FatalError("create directory: %v", err)
 		}
 	}
 
 	if err := os.WriteFile(recipe.Path, []byte(recipes.Template), 0o644); err != nil { // #nosec G306 -- config files need to be readable
-		fmt.Fprintf(os.Stderr, "Error: write file: %v\n", err)
-		os.Exit(1)
+		FatalError("write file: %v", err)
 	}
 
 	fmt.Printf("\n✓ %s integration installed\n", recipe.Name)
@@ -302,6 +298,18 @@ func runCodexRecipe() {
 	setup.InstallCodex()
 }
 
+func runMuxRecipe() {
+	if setupCheck {
+		setup.CheckMux(setupProject, setupGlobal)
+		return
+	}
+	if setupRemove {
+		setup.RemoveMux(setupProject, setupGlobal)
+		return
+	}
+	setup.InstallMux(setupProject, setupGlobal)
+}
+
 func runAiderRecipe() {
 	if setupCheck {
 		setup.CheckAider()
@@ -349,7 +357,8 @@ func init() {
 	// Per-recipe flags
 	setupCmd.Flags().BoolVar(&setupCheck, "check", false, "Check if integration is installed")
 	setupCmd.Flags().BoolVar(&setupRemove, "remove", false, "Remove the integration")
-	setupCmd.Flags().BoolVar(&setupProject, "project", false, "Install for this project only (claude/gemini)")
+	setupCmd.Flags().BoolVar(&setupProject, "project", false, "Install for this project only (claude/gemini/mux)")
+	setupCmd.Flags().BoolVar(&setupGlobal, "global", false, "Install globally (mux only; writes ~/.mux/AGENTS.md)")
 	setupCmd.Flags().BoolVar(&setupStealth, "stealth", false, "Use stealth mode (claude/gemini)")
 
 	rootCmd.AddCommand(setupCmd)

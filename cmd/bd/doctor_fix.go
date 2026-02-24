@@ -202,18 +202,15 @@ func applyFixesInteractive(path string, issues []doctorCheck) {
 func applyFixList(path string, fixes []doctorCheck) {
 	// Apply fixes in a dependency-aware order.
 	// Rough dependency chain:
-	// permissions/lock cleanup → config sanity → DB integrity/migrations → DB↔JSONL sync.
+	// permissions/lock cleanup → config sanity → DB integrity/migrations.
 	order := []string{
 		"Lock Files",
 		"Permissions",
 		"Daemon Health",
 		"Database Config",
-		"JSONL Config",
 		"Database Integrity",
 		"Database",
 		"Schema Compatibility",
-		"JSONL Integrity",
-		"Sync Divergence",
 	}
 	priority := make(map[string]int, len(order))
 	for i, name := range order {
@@ -247,6 +244,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 		switch check.Name {
 		case "Gitignore":
 			err = doctor.FixGitignore()
+		case "Project Gitignore":
+			err = doctor.FixProjectGitignore()
 		case "Redirect Tracking":
 			err = doctor.FixRedirectTracking()
 		case "Last-Touched Tracking":
@@ -254,7 +253,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 		case "Git Hooks":
 			err = fix.GitHooks(path)
 		case "Sync Divergence":
-			err = fix.SyncDivergence(path)
+			fmt.Printf("  ⚠ Sync divergence fix removed (Dolt-native sync)\n")
+			continue
 		case "Permissions":
 			err = fix.Permissions(path)
 		case "Database":
@@ -264,9 +264,8 @@ func applyFixList(path string, fixes []doctorCheck) {
 				err = mErr
 			}
 		case "Database Integrity":
-			// Corruption detected - try recovery from JSONL
-			// Pass force and source flags for enhanced recovery
-			err = fix.DatabaseCorruptionRecoveryWithOptions(path, doctorForce, doctorSource)
+			// Corruption detected - backup and reinitialize
+			err = fix.DatabaseIntegrity(path)
 		case "Schema Compatibility":
 			err = fix.SchemaCompatibility(path)
 		case "Repo Fingerprint":
@@ -278,11 +277,11 @@ func applyFixList(path string, fixes []doctorCheck) {
 		case "Database Config":
 			err = fix.DatabaseConfig(path)
 		case "JSONL Config":
-			err = fix.LegacyJSONLConfig(path)
-		case "JSONL Integrity":
-			err = fix.JSONLIntegrity(path)
+			fmt.Printf("  ⚠ JSONL config migration removed (Dolt-native sync)\n")
+			continue
 		case "Untracked Files":
-			err = fix.UntrackedJSONL(path)
+			fmt.Printf("  ⚠ Untracked JSONL fix removed (Dolt-native storage)\n")
+			continue
 		case "Merge Artifacts":
 			err = fix.MergeArtifacts(path)
 		case "Orphaned Dependencies":
@@ -304,7 +303,7 @@ func applyFixList(path string, fixes []doctorCheck) {
 			continue
 		case "Git Conflicts":
 			// No auto-fix: git conflicts require manual resolution
-			fmt.Printf("  ⚠ Resolve conflicts manually: git checkout --ours or --theirs .beads/issues.jsonl\n")
+			fmt.Printf("  ⚠ Resolve conflicts manually\n")
 			continue
 		case "Stale Closed Issues":
 			// consolidate cleanup into doctor --fix

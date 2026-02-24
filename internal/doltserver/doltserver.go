@@ -223,7 +223,10 @@ func IsRunning(beadsDir string) (*State, error) {
 // EnsureRunning starts the server if it is not already running.
 // This is the main auto-start entry point. Thread-safe via file lock.
 // Under Gas Town (GT_ROOT set), resolves to the canonical server directory
-// so all worktrees share one server.
+// so all worktrees share one server. If the server is not running under
+// Gas Town, returns an error directing the user to start via gt — bd must
+// never auto-start a Dolt server under Gas Town because gt manages the
+// canonical data directory (.dolt-data/).
 // Returns the port the server is listening on.
 func EnsureRunning(beadsDir string) (int, error) {
 	serverDir := resolveServerDir(beadsDir)
@@ -236,6 +239,16 @@ func EnsureRunning(beadsDir string) (int, error) {
 		// Touch activity file so idle monitor knows we're active
 		touchActivity(serverDir)
 		return state.Port, nil
+	}
+
+	// Under Gas Town, gt manages the Dolt server lifecycle using .dolt-data/.
+	// bd must not auto-start its own server — it would use .beads/dolt/ which
+	// is the wrong data directory, resulting in an empty database.
+	if os.Getenv("GT_ROOT") != "" {
+		return 0, fmt.Errorf("Dolt server is not running.\n\n"+
+			"Under Gas Town, the Dolt server is managed by gt (data in .dolt-data/).\n"+
+			"Start it with: gt dolt start\n\n"+
+			"Do NOT use 'bd dolt start' — it uses a different data directory.")
 	}
 
 	s, err := Start(serverDir)

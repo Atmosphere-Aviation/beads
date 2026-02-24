@@ -228,26 +228,22 @@ project path. PID and logs are stored in .beads/.
 The server auto-starts transparently when needed, so manual start is rarely
 required. Use this command for explicit control or diagnostics.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Under Gas Town, gt manages the Dolt server lifecycle.
+		// bd must not start its own server — it uses .beads/dolt/ which is
+		// the wrong data directory (gt uses .dolt-data/).
+		if os.Getenv("GT_ROOT") != "" {
+			fmt.Fprintf(os.Stderr, "Error: Under Gas Town, the Dolt server is managed by gt.\n\n"+
+				"Use 'gt dolt start' instead of 'bd dolt start'.\n"+
+				"The gt server uses .dolt-data/ (canonical data directory).\n")
+			os.Exit(1)
+		}
+
 		beadsDir := beads.FindBeadsDir()
 		if beadsDir == "" {
 			fmt.Fprintf(os.Stderr, "Error: not in a beads repository (no .beads directory found)\n")
 			os.Exit(1)
 		}
 		serverDir := doltserver.ResolveServerDir(beadsDir)
-
-		if doltserver.IsDaemonManaged() {
-			// Check if daemon's server is already accepting connections
-			cfg := doltserver.DefaultConfig(serverDir)
-			addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-			conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
-			if err == nil {
-				_ = conn.Close()
-				fmt.Printf("Dolt server already running on port %d (managed by Gas Town daemon)\n", cfg.Port)
-				return
-			}
-			fmt.Fprintf(os.Stderr, "Warning: Dolt server is normally managed by the Gas Town daemon,\n"+
-				"but no server found on port %d. Starting one.\n\n", cfg.Port)
-		}
 
 		state, err := doltserver.Start(serverDir)
 		if err != nil {

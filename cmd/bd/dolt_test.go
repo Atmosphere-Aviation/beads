@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
@@ -370,11 +371,17 @@ func TestDoltSetConfigWithUpdateConfig(t *testing.T) {
 func TestTestServerConnection(t *testing.T) {
 	// Test the testServerConnection function with various configs
 	t.Run("unreachable host", func(t *testing.T) {
+		// Use a short dial timeout to avoid slow hangs in CI where
+		// 192.0.2.1 (RFC 5737 TEST-NET) may not get a fast rejection.
+		old := serverDialTimeout
+		serverDialTimeout = 500 * time.Millisecond
+		t.Cleanup(func() { serverDialTimeout = old })
+
 		cfg := configfile.DefaultConfig()
 		cfg.DoltServerHost = "192.0.2.1" // RFC 5737 TEST-NET, guaranteed unreachable
 		cfg.DoltServerPort = 3307
 
-		result := testServerConnection(cfg)
+		result := testServerConnection(cfg.DoltServerHost, cfg.DoltServerPort)
 		if result {
 			t.Error("expected connection to fail for unreachable host")
 		}
@@ -387,7 +394,7 @@ func TestTestServerConnection(t *testing.T) {
 		cfg.DoltServerHost = "127.0.0.1"
 		cfg.DoltServerPort = 59999 // Unlikely to be in use
 
-		result := testServerConnection(cfg)
+		result := testServerConnection(cfg.DoltServerHost, cfg.DoltServerPort)
 		if result {
 			t.Error("expected connection to fail for unused port")
 		}
@@ -398,7 +405,7 @@ func TestTestServerConnection(t *testing.T) {
 		cfg.DoltServerHost = "::1"
 		cfg.DoltServerPort = 59998 // Unlikely to be in use
 
-		result := testServerConnection(cfg)
+		result := testServerConnection(cfg.DoltServerHost, cfg.DoltServerPort)
 		if result {
 			t.Error("expected connection to fail for unused port on IPv6")
 		}
@@ -511,6 +518,12 @@ func TestDoltConfigEnvironmentOverrides(t *testing.T) {
 }
 
 func TestDoltServerIsRunning(t *testing.T) {
+	// Clear GT_ROOT so IsRunning doesn't find the Gas Town daemon's real PID file.
+	if old, ok := os.LookupEnv("GT_ROOT"); ok {
+		os.Unsetenv("GT_ROOT")
+		t.Cleanup(func() { os.Setenv("GT_ROOT", old) })
+	}
+
 	t.Run("no server running", func(t *testing.T) {
 		beadsDir := t.TempDir()
 		state, err := doltserver.IsRunning(beadsDir)
